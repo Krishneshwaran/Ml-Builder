@@ -1,0 +1,68 @@
+Build a web-based no-code Machine Learning Model Builder and Integration Platform.
+
+Goal:
+Create a platform where users can design, train, evaluate, deploy, and integrate production-ready machine learning models for real-world systems (not just demos), without writing ML code. The platform focuses on building the ML backend, not the full application.
+
+Core Concept:
+This is NOT an app builder.
+This is a “Machine Learning Factory” that produces deployable ML models exposed via APIs, which users can integrate into their own web, mobile, or IoT applications.
+
+Key Features:
+
+1. System Template Selection
+- Show templates such as:
+  - Access Control / Identity Verification
+  - Exam Proctoring
+  - Smart Waste Sorting
+  - Retail Behavior Analytics
+  - Document Processing & Classification
+  - Crowd & Traffic Monitoring
+- Each template defines the ML pipeline automatically.
+
+2. Data Upload & Labeling UI
+- Support images, audio, video, text, and CSV.
+- Drag-and-drop upload.
+- Visual labeling tools.
+- Dataset validation and preview.
+
+3. Automatic ML Pipeline Builder
+- Auto-create multi-stage pipelines:
+  - preprocessing
+  - feature extraction
+  - model inference
+  - post-processing
+- User does NOT select algorithms manually.
+
+4. Training & Evaluation Dashboard
+- One-click training.
+- Show metrics like accuracy, confidence, false positives/negatives.
+- Threshold tuning slider.
+- Retraining support.
+
+5. Deployment Options
+- Deploy as:
+  - Cloud REST API
+  - Edge/on-device model
+- Generate API endpoint, auth key, and usage instructions.
+
+6. Integration Panel
+- Show example API calls.
+- Provide copy-paste code snippets (fetch / curl).
+- Allow exporting logs to Google Sheets or CSV.
+
+UI Requirements:
+- Clean, modern dashboard UI.
+- Step-by-step flow: Template → Data → Train → Evaluate → Deploy → Integrate.
+- No references to “learning demo” or “toy AI”.
+
+Constraints:
+- Do NOT auto-generate a full attendance app.
+- Do NOT hide ML logic behind vague AI terms.
+- Emphasize system-level ML, not just classification demos.
+
+Output:
+- A functional frontend prototype that demonstrates the full ML lifecycle.
+- Clear separation between ML backend and application integration.
+
+Tone:
+Professional, production-focused, and realistic (enterprise-style, not hobbyist).
