@@ -54,7 +54,7 @@ export default function Help() {
       <div>
         <h1 className="text-2xl font-bold text-foreground">Help & Resources</h1>
         <p className="text-muted-foreground">
-          Find answers and learn how to get the most out of MLForge
+          Find answers and learn how to get the most out of AutoML
         </p>
       </div>
 

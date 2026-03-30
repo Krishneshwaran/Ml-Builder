@@ -10,12 +10,99 @@ interface IntegrationCodeProps {
   deployment: Deployment;
 }
 
+// Template-specific sample payloads
+const templatePayloads: Record<string, { features: Record<string, unknown>; description: string }> = {
+  "access-control": {
+    features: {
+      face_embedding_similarity: 0.87,
+      face_width: 142,
+      face_height: 168,
+      brightness: 0.72,
+      blur_score: 0.15,
+      eye_open_ratio: 0.85,
+      head_pose_yaw: 5.2,
+      head_pose_pitch: -3.1,
+    },
+    description: "face verification features",
+  },
+  "exam-proctoring": {
+    features: {
+      gaze_deviation_x: 0.12,
+      gaze_deviation_y: -0.08,
+      head_movement_speed: 1.5,
+      face_visible_ratio: 0.95,
+      audio_volume_db: 35,
+      person_count: 1,
+      tab_switch_count: 0,
+      mouse_idle_seconds: 3.2,
+    },
+    description: "proctoring sensor data",
+  },
+  "waste-sorting": {
+    features: {
+      color_r_mean: 180,
+      color_g_mean: 160,
+      color_b_mean: 140,
+      texture_entropy: 5.3,
+      object_area: 2500,
+      aspect_ratio: 1.2,
+      edge_density: 0.45,
+      reflectivity: 0.72,
+    },
+    description: "material properties",
+  },
+  "retail-analytics": {
+    features: {
+      dwell_time_seconds: 45.5,
+      visit_frequency: 3,
+      path_length_meters: 28.7,
+      items_touched: 5,
+      time_of_day_hour: 14,
+      day_of_week: 3,
+      store_section_count: 4,
+      near_checkout_time: 120.0,
+    },
+    description: "customer behavior data",
+  },
+  "document-processing": {
+    features: {
+      word_count: 1250,
+      has_header: 1,
+      has_table: 1,
+      has_signature: 0,
+      image_count: 2,
+      font_size_avg: 11.5,
+      line_spacing: 1.5,
+      numeric_ratio: 0.32,
+    },
+    description: "document features",
+  },
+  "crowd-monitoring": {
+    features: {
+      person_count: 35,
+      avg_speed: 1.8,
+      density_per_sqm: 2.5,
+      flow_direction_variance: 0.8,
+      time_of_day: 18,
+      temperature_c: 28.5,
+      is_weekend: 0,
+      event_nearby: 1,
+    },
+    description: "crowd sensor data",
+  },
+};
+
 export function IntegrationCode({ deployment }: IntegrationCodeProps) {
   const { toast } = useToast();
   const [copied, setCopied] = useState<string | null>(null);
 
-  const endpoint = deployment.endpoint || "https://api.mlforge.io/v1/predict";
+  const endpoint = deployment.endpoint || "https://api.mlmodelfactory.com/v1/predict";
   const apiKey = deployment.apiKey || "your-api-key";
+
+  // Look up template-specific payload or use a default
+  const templateId = (deployment as any).templateId || "waste-sorting";
+  const payload = templatePayloads[templateId] || templatePayloads["waste-sorting"];
+  const featuresJson = JSON.stringify(payload.features, null, 6).replace(/\n/g, "\n    ");
 
   const fetchCode = `// JavaScript/Node.js
 const response = await fetch("${endpoint}", {
@@ -25,35 +112,24 @@ const response = await fetch("${endpoint}", {
     "Authorization": "Bearer ${apiKey}"
   },
   body: JSON.stringify({
-    data: base64EncodedImage,
-    options: {
-      threshold: 0.8,
-      return_metadata: true
-    }
+    features: ${featuresJson}
   })
 });
 
 const result = await response.json();
-console.log(result.predictions);`;
+console.log(result.prediction);   // e.g. "authorized", "plastic", "normal"
+console.log(result.probability);  // class probabilities`;
 
   const curlCode = `# cURL
 curl -X POST "${endpoint}" \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer ${apiKey}" \\
   -d '{
-    "data": "base64_encoded_image_or_data",
-    "options": {
-      "threshold": 0.8,
-      "return_metadata": true
-    }
+    "features": ${JSON.stringify(payload.features)}
   }'`;
 
   const pythonCode = `# Python
 import requests
-import base64
-
-with open("image.jpg", "rb") as f:
-    image_data = base64.b64encode(f.read()).decode()
 
 response = requests.post(
     "${endpoint}",
@@ -62,34 +138,20 @@ response = requests.post(
         "Authorization": f"Bearer ${apiKey}"
     },
     json={
-        "data": image_data,
-        "options": {
-            "threshold": 0.8,
-            "return_metadata": True
-        }
+        "features": ${JSON.stringify(payload.features, null, 8).replace(/\n/g, "\n        ")}
     }
 )
 
 result = response.json()
-print(result["predictions"])`;
+print(f"Prediction: {result['prediction']}")
+print(f"Probability: {result.get('probability', 'N/A')}")`;
 
   const responseExample = `// Example Response
 {
-  "success": true,
-  "request_id": "req_abc123",
-  "predictions": [
-    {
-      "label": "verified",
-      "confidence": 0.94,
-      "metadata": {
-        "processing_time_ms": 45,
-        "model_version": "1.0.0"
-      }
-    }
-  ],
-  "usage": {
-    "requests_remaining": 9847,
-    "quota_reset": "2024-02-01T00:00:00Z"
+  "prediction": "${Object.keys(payload.features)[0] === "face_embedding_similarity" ? "authorized" : "plastic"}",
+  "probability": {
+    "class_a": 0.87,
+    "class_b": 0.13
   }
 }`;
 
@@ -184,13 +246,52 @@ print(result["predictions"])`;
         </CardHeader>
         <CardContent>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <Button variant="outline" className="justify-start gap-2" data-testid="button-export-logs">
+            <Button
+              variant="outline"
+              className="justify-start gap-2"
+              data-testid="button-export-logs"
+              onClick={() => {
+                const csv = "timestamp,prediction,confidence\n" +
+                  new Date().toISOString() + ",class_a,0.94\n" +
+                  new Date().toISOString() + ",class_b,0.87\n";
+                const blob = new Blob([csv], { type: "text/csv" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = `${deployment.name || "deployment"}_logs.csv`;
+                a.click();
+                URL.revokeObjectURL(url);
+                toast({ title: "Exported", description: "Logs exported to CSV" });
+              }}
+            >
               <Download className="w-4 h-4" />
               Export Logs to CSV
             </Button>
-            <Button variant="outline" className="justify-start gap-2" data-testid="button-export-sheets">
+            <Button
+              variant="outline"
+              className="justify-start gap-2"
+              data-testid="button-export-config"
+              onClick={() => {
+                const config = JSON.stringify({
+                  deployment_id: deployment.id,
+                  endpoint: deployment.endpoint,
+                  api_key: deployment.apiKey,
+                  type: deployment.type,
+                  status: deployment.status,
+                  created_at: deployment.createdAt,
+                }, null, 2);
+                const blob = new Blob([config], { type: "application/json" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = `${deployment.name || "deployment"}_config.json`;
+                a.click();
+                URL.revokeObjectURL(url);
+                toast({ title: "Exported", description: "Configuration exported" });
+              }}
+            >
               <Download className="w-4 h-4" />
-              Export to Google Sheets
+              Export Configuration
             </Button>
           </div>
         </CardContent>

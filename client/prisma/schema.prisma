@@ -1,0 +1,89 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model Project {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  templateId  String   @map("template_id")
+  status      String   @default("draft")
+  currentStep Int      @default(1) @map("current_step")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @default(now()) @map("updated_at")
+
+  datasets    Dataset[]
+  models      MlModel[]
+  deployments Deployment[]
+
+  @@map("projects")
+}
+
+model Dataset {
+  id          String   @id @default(uuid())
+  projectId   String   @map("project_id")
+  name        String
+  fileCount   Int      @default(0) @map("file_count")
+  totalSize   Int      @default(0) @map("total_size")
+  dataType    String   @map("data_type")
+  labelCount  Int      @default(0) @map("label_count")
+  isValidated Boolean  @default(false) @map("is_validated")
+  labels      Json     @default("[]")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@map("datasets")
+}
+
+model MlModel {
+  id                  String    @id @default(uuid())
+  projectId           String    @map("project_id")
+  name                String
+  status              String    @default("pending")
+  algorithm           String?   @map("algorithm")
+  datasetSize         Int?      @map("dataset_size")
+  featureNames        Json?     @map("feature_names")
+  accuracy            Int?
+  precisionScore      Int?      @map("precision_score")
+  recallScore         Int?      @map("recall_score")
+  f1Score             Int?      @map("f1_score")
+  confidenceThreshold Int       @default(80) @map("confidence_threshold")
+  falsePositiveRate   Int?      @map("false_positive_rate")
+  falseNegativeRate   Int?      @map("false_negative_rate")
+  trainingProgress    Int       @default(0) @map("training_progress")
+  trainedAt           DateTime? @map("trained_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+
+  project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  deployments Deployment[]
+
+  @@map("ml_models")
+}
+
+model Deployment {
+  id            String    @id @default(uuid())
+  projectId     String    @map("project_id")
+  modelId       String    @map("model_id")
+  name          String
+  type          String
+  status        String    @default("pending")
+  endpoint      String?
+  apiKey        String?   @map("api_key")
+  requestsToday Int       @default(0) @map("requests_today")
+  totalRequests Int       @default(0) @map("total_requests")
+  avgLatency    Int?      @map("avg_latency")
+  deployedAt    DateTime? @map("deployed_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  model   MlModel @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@map("deployments")
+}

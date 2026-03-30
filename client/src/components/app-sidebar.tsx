@@ -57,12 +57,12 @@ export function AppSidebar() {
             <Cpu className="w-5 h-5 text-primary-foreground" />
           </div>
           <div className="flex flex-col">
-            <span className="text-base font-semibold text-sidebar-foreground">MLForge</span>
+            <span className="text-base font-semibold text-sidebar-foreground">AutoML</span>
             <span className="text-xs text-muted-foreground">ML Factory</span>
           </div>
         </Link>
       </SidebarHeader>
-      
+
       <SidebarContent className="p-2">
         <SidebarGroup>
           <SidebarGroupLabel className="text-xs font-medium text-muted-foreground px-2 mb-1">

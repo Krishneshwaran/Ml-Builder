@@ -1,6 +1,3 @@
-import { sql } from "drizzle-orm";
-import { pgTable, text, varchar, integer, boolean, timestamp, jsonb } from "drizzle-orm/pg-core";
-import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
 // System Templates - predefined ML pipeline templates
@@ -63,114 +60,109 @@ export const systemTemplates = [
 
 export type SystemTemplate = typeof systemTemplates[number];
 
-// Projects Table
-export const projects = pgTable("projects", {
-  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-  name: text("name").notNull(),
-  description: text("description"),
-  templateId: text("template_id").notNull(),
-  status: text("status").notNull().default("draft"), // draft, data-uploaded, training, trained, deployed
-  currentStep: integer("current_step").notNull().default(1), // 1-6 for the workflow steps
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
-});
+// ── TypeScript types (matching Prisma schema) ───────────────────────────
 
-export const insertProjectSchema = createInsertSchema(projects).omit({
-  id: true,
-  createdAt: true,
-  updatedAt: true,
+export interface Project {
+  id: string;
+  name: string;
+  description: string | null;
+  templateId: string;
+  status: string;
+  currentStep: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export const insertProjectSchema = z.object({
+  name: z.string().min(1),
+  description: z.string().nullable().optional(),
+  templateId: z.string().min(1),
+  status: z.string().default("draft"),
+  currentStep: z.number().default(1),
 });
 
 export type InsertProject = z.infer<typeof insertProjectSchema>;
-export type Project = typeof projects.$inferSelect;
 
-// Datasets Table
-export const datasets = pgTable("datasets", {
-  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-  projectId: varchar("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
-  name: text("name").notNull(),
-  fileCount: integer("file_count").notNull().default(0),
-  totalSize: integer("total_size").notNull().default(0), // in bytes
-  dataType: text("data_type").notNull(), // images, video, audio, text, csv
-  labelCount: integer("label_count").notNull().default(0),
-  isValidated: boolean("is_validated").notNull().default(false),
-  labels: jsonb("labels").$type<string[]>().default([]),
-  createdAt: timestamp("created_at").defaultNow(),
-});
+export interface Dataset {
+  id: string;
+  projectId: string;
+  name: string;
+  fileCount: number;
+  totalSize: number;
+  dataType: string;
+  labelCount: number;
+  isValidated: boolean;
+  labels: string[];
+  createdAt: string;
+}
 
-export const insertDatasetSchema = createInsertSchema(datasets).omit({
-  id: true,
-  createdAt: true,
+export const insertDatasetSchema = z.object({
+  projectId: z.string(),
+  name: z.string(),
+  fileCount: z.number().default(0),
+  totalSize: z.number().default(0),
+  dataType: z.string(),
+  labelCount: z.number().default(0),
+  isValidated: z.boolean().default(false),
+  labels: z.array(z.string()).default([]),
 });
 
 export type InsertDataset = z.infer<typeof insertDatasetSchema>;
-export type Dataset = typeof datasets.$inferSelect;
 
-// ML Models Table
-export const mlModels = pgTable("ml_models", {
-  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-  projectId: varchar("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
-  name: text("name").notNull(),
-  status: text("status").notNull().default("pending"), // pending, training, completed, failed
-  accuracy: integer("accuracy"), // percentage 0-100
-  precision: integer("precision_score"), // percentage 0-100
-  recall: integer("recall_score"), // percentage 0-100
-  f1Score: integer("f1_score"), // percentage 0-100
-  confidenceThreshold: integer("confidence_threshold").notNull().default(80),
-  falsePositiveRate: integer("false_positive_rate"),
-  falseNegativeRate: integer("false_negative_rate"),
-  trainingProgress: integer("training_progress").notNull().default(0), // 0-100
-  trainedAt: timestamp("trained_at"),
-  createdAt: timestamp("created_at").defaultNow(),
-});
+export interface MlModel {
+  id: string;
+  projectId: string;
+  name: string;
+  status: string;
+  accuracy: number | null;
+  precisionScore: number | null;
+  recallScore: number | null;
+  f1Score: number | null;
+  confidenceThreshold: number;
+  falsePositiveRate: number | null;
+  falseNegativeRate: number | null;
+  trainingProgress: number;
+  trainedAt: string | null;
+  algorithm?: string | null;
+  datasetSize?: number | null;
+  featureNames?: string[] | null;
+  createdAt: string;
+}
 
-export const insertMlModelSchema = createInsertSchema(mlModels).omit({
-  id: true,
-  createdAt: true,
+export const insertMlModelSchema = z.object({
+  projectId: z.string(),
+  name: z.string(),
+  status: z.string().default("pending"),
+  confidenceThreshold: z.number().default(80),
+  trainingProgress: z.number().default(0),
 });
 
 export type InsertMlModel = z.infer<typeof insertMlModelSchema>;
-export type MlModel = typeof mlModels.$inferSelect;
 
-// Deployments Table
-export const deployments = pgTable("deployments", {
-  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-  projectId: varchar("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
-  modelId: varchar("model_id").notNull().references(() => mlModels.id, { onDelete: "cascade" }),
-  name: text("name").notNull(),
-  type: text("type").notNull(), // cloud-api, edge-device
-  status: text("status").notNull().default("pending"), // pending, deploying, active, stopped
-  endpoint: text("endpoint"),
-  apiKey: text("api_key"),
-  requestsToday: integer("requests_today").notNull().default(0),
-  totalRequests: integer("total_requests").notNull().default(0),
-  avgLatency: integer("avg_latency"), // in ms
-  deployedAt: timestamp("deployed_at"),
-  createdAt: timestamp("created_at").defaultNow(),
-});
+export interface Deployment {
+  id: string;
+  projectId: string;
+  modelId: string;
+  name: string;
+  type: string;
+  status: string;
+  endpoint: string | null;
+  apiKey: string | null;
+  requestsToday: number;
+  totalRequests: number;
+  avgLatency: number | null;
+  deployedAt: string | null;
+  createdAt: string;
+}
 
-export const insertDeploymentSchema = createInsertSchema(deployments).omit({
-  id: true,
-  createdAt: true,
+export const insertDeploymentSchema = z.object({
+  projectId: z.string(),
+  modelId: z.string(),
+  name: z.string(),
+  type: z.string(),
 });
 
 export type InsertDeployment = z.infer<typeof insertDeploymentSchema>;
-export type Deployment = typeof deployments.$inferSelect;
-
-// Users Table (kept from original)
-export const users = pgTable("users", {
-  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-  username: text("username").notNull().unique(),
-  password: text("password").notNull(),
-});
-
-export const insertUserSchema = createInsertSchema(users).pick({
-  username: true,
-  password: true,
-});
-
-export type InsertUser = z.infer<typeof insertUserSchema>;
-export type User = typeof users.$inferSelect;
 
 // Pipeline stages type
 export type PipelineStage = {

@@ -12,16 +12,24 @@ interface TrainingMetricsProps {
 export function TrainingMetrics({ model, onThresholdChange }: TrainingMetricsProps) {
   const metrics = [
     { name: "Accuracy", value: model.accuracy ?? 0, color: "bg-chart-1" },
-    { name: "Precision", value: model.precision ?? 0, color: "bg-chart-2" },
-    { name: "Recall", value: model.recall ?? 0, color: "bg-chart-4" },
+    { name: "Precision", value: model.precisionScore ?? 0, color: "bg-chart-2" },
+    { name: "Recall", value: model.recallScore ?? 0, color: "bg-chart-4" },
     { name: "F1 Score", value: model.f1Score ?? 0, color: "bg-chart-3" },
   ];
 
   return (
     <div className="space-y-6" data-testid="training-metrics">
       <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base">Model Performance</CardTitle>
+        <CardHeader className="pb-3 border-b border-border/50 mb-4">
+          <div className="flex items-start justify-between">
+            <CardTitle className="text-base">Model Performance</CardTitle>
+            {model.algorithm && (
+              <div className="text-right">
+                <p className="text-sm font-medium text-foreground">{model.algorithm}</p>
+                <p className="text-xs text-muted-foreground mt-0.5">Trained on {model.datasetSize?.toLocaleString() || 600} samples</p>
+              </div>
+            )}
+          </div>
         </CardHeader>
         <CardContent className="space-y-4">
           {metrics.map((metric) => (

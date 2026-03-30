@@ -9,7 +9,7 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
-  
+
   // Projects
   app.get("/api/projects", async (req, res) => {
     try {
@@ -252,7 +252,7 @@ export async function registerRoutes(
       }
 
       const apiKey = `mlf_sk_live_${randomBytes(32).toString('hex').slice(0, 40)}`;
-      const endpoint = `https://api.mlforge.io/v1/${project.templateId}/predict`;
+      const endpoint = `https://api.AutoML.io/v1/${project.templateId}/predict`;
 
       const deploymentData = insertDeploymentSchema.parse({
         projectId: req.params.id,

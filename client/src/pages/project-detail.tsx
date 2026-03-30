@@ -8,9 +8,9 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { WorkflowSteps } from "@/components/workflow-steps";
 import { TemplateCard } from "@/components/template-card";
 import { DataUploadZone } from "@/components/data-upload-zone";
-import { LabelEditor } from "@/components/label-editor";
 import { PipelineBuilder } from "@/components/pipeline-builder";
 import { TrainingMetrics } from "@/components/training-metrics";
+import { LiveTrainingLogs } from "@/components/live-training-logs";
 import { DeploymentPanel } from "@/components/deployment-panel";
 import { IntegrationCode } from "@/components/integration-code";
 import { useToast } from "@/hooks/use-toast";
@@ -21,8 +21,9 @@ export default function ProjectDetail() {
   const { id } = useParams<{ id: string }>();
   const [, setLocation] = useLocation();
   const { toast } = useToast();
-  const [labels, setLabels] = useState<string[]>([]);
   const [currentStep, setCurrentStep] = useState(1);
+  const [isDatasetUploaded, setIsDatasetUploaded] = useState(false);
+  const [pipelineProgress, setPipelineProgress] = useState(0);
 
   const { data: project, isLoading: projectLoading } = useQuery<Project>({
     queryKey: ["/api/projects", id],
@@ -42,6 +43,10 @@ export default function ProjectDetail() {
       if (data?.status === "training") {
         return 1000;
       }
+      // Continue polling for a bit after training completes to ensure UI updates
+      if (data?.status === "completed" && currentStep === 4) {
+        return 2000;
+      }
       return false;
     },
   });
@@ -57,13 +62,46 @@ export default function ProjectDetail() {
     }
   }, [project]);
 
+  // Auto-advance to deployment step when training completes
+  useEffect(() => {
+    if (model?.status === "completed" && currentStep === 4) {
+      // Wait a moment for the user to see the completion state, then suggest moving forward
+      const timer = setTimeout(() => {
+        toast({
+          title: "Training Complete!",
+          description: "Your model is ready. Click 'Continue to Deploy' to proceed.",
+        });
+      }, 1500);
+      return () => clearTimeout(timer);
+    }
+  }, [model?.status, currentStep, toast]);
+
   const template = systemTemplates.find((t) => t.id === project?.templateId);
+
+  useEffect(() => {
+    if (currentStep === 3 && template) {
+      if (pipelineProgress < template.pipelineStages.length) {
+        const timer = setTimeout(() => {
+          setPipelineProgress(prev => prev + 1);
+        }, 800);
+        return () => clearTimeout(timer);
+      }
+    }
+  }, [currentStep, pipelineProgress, template]);
 
   const pipelineStages: PipelineStage[] = template?.pipelineStages.map((stage, index) => ({
     id: stage,
     name: stage,
     description: "",
-    status: currentStep > 3 ? "completed" : currentStep === 3 && index === 0 ? "processing" : "pending",
+    status: currentStep > 3
+      ? "completed"
+      : currentStep === 3
+        ? index < pipelineProgress
+          ? "completed"
+          : index === pipelineProgress
+            ? "processing"
+            : "pending"
+        : "pending",
     order: index + 1,
   })) || [];
 
@@ -74,31 +112,6 @@ export default function ProjectDetail() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/projects", id] });
-    },
-  });
-
-  const createDataset = useMutation({
-    mutationFn: async () => {
-      const res = await apiRequest("POST", `/api/projects/${id}/dataset`, {
-        name: `${project?.name} Dataset`,
-        fileCount: 250,
-        totalSize: 52428800,
-        dataType: template?.dataTypes[0] || "images",
-        labelCount: labels.length,
-        isValidated: true,
-        labels,
-        projectId: id,
-      });
-      return res.json();
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/projects", id, "dataset"] });
-      updateProject.mutate({ currentStep: 3, status: "data-uploaded" });
-      setCurrentStep(3);
-      toast({
-        title: "Dataset uploaded",
-        description: "Your data has been validated and is ready for training.",
-      });
     },
   });
 
@@ -143,9 +156,7 @@ export default function ProjectDetail() {
   });
 
   const handleNextStep = () => {
-    if (currentStep === 2) {
-      createDataset.mutate();
-    } else if (currentStep === 3) {
+    if (currentStep === 3) {
       startTraining.mutate();
     } else if (currentStep === 4 && model?.status === "completed") {
       updateProject.mutate({ currentStep: 5 });
@@ -208,8 +219,10 @@ export default function ProjectDetail() {
       case 2:
         return (
           <div className="space-y-6">
-            <DataUploadZone acceptedTypes={template?.dataTypes || ["images"]} />
-            <LabelEditor labels={labels} onLabelsChange={setLabels} />
+            <DataUploadZone
+              projectId={project.id}
+              onUploadComplete={() => setIsDatasetUploaded(true)}
+            />
           </div>
         );
 
@@ -235,39 +248,48 @@ export default function ProjectDetail() {
         return (
           <div className="space-y-6">
             {model?.status === "training" ? (
-              <Card>
-                <CardContent className="py-12 text-center">
-                  <Loader2 className="w-12 h-12 mx-auto mb-4 text-primary animate-spin" />
-                  <h3 className="text-lg font-medium text-foreground mb-2">Training in Progress</h3>
-                  <p className="text-sm text-muted-foreground mb-4">
-                    Your model is being trained. This typically takes 5-15 minutes.
-                  </p>
-                  <div className="max-w-xs mx-auto">
-                    <div className="flex justify-between text-xs text-muted-foreground mb-1">
-                      <span>Progress</span>
-                      <span>{model.trainingProgress || 0}%</span>
+              <>
+                <Card>
+                  <CardContent className="py-12 text-center">
+                    <Loader2 className="w-12 h-12 mx-auto mb-4 text-primary animate-spin" />
+                    <h3 className="text-lg font-medium text-foreground mb-2">Training in Progress</h3>
+                    <p className="text-sm text-muted-foreground mb-4">
+                      Your model is being trained. This typically takes 5-15 minutes.
+                    </p>
+                    <div className="max-w-xs mx-auto">
+                      <div className="flex justify-between text-xs text-muted-foreground mb-1">
+                        <span>Progress</span>
+                        <span>{model.trainingProgress || 0}%</span>
+                      </div>
+                      <div className="h-2 bg-muted rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-primary transition-all duration-500"
+                          style={{ width: `${model.trainingProgress || 0}%` }}
+                        />
+                      </div>
                     </div>
-                    <div className="h-2 bg-muted rounded-full overflow-hidden">
-                      <div
-                        className="h-full bg-primary transition-all duration-500"
-                        style={{ width: `${model.trainingProgress || 0}%` }}
-                      />
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
+                  </CardContent>
+                </Card>
+                <LiveTrainingLogs progress={model.trainingProgress || 0} />
+              </>
             ) : model?.status === "completed" ? (
               <>
                 <Card>
                   <CardContent className="py-6">
-                    <div className="flex items-center gap-3">
-                      <CheckCircle className="w-8 h-8 text-chart-2" />
-                      <div>
-                        <h3 className="font-medium text-foreground">Training Complete</h3>
-                        <p className="text-sm text-muted-foreground">
-                          Your model has been trained successfully and is ready for evaluation.
-                        </p>
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-3">
+                        <CheckCircle className="w-8 h-8 text-chart-2" />
+                        <div>
+                          <h3 className="font-medium text-foreground">Training Complete</h3>
+                          <p className="text-sm text-muted-foreground">
+                            Your model has been trained successfully and is ready for deployment.
+                          </p>
+                        </div>
                       </div>
+                      <Button onClick={handleNextStep} data-testid="button-continue-to-deploy">
+                        Continue to Deploy
+                        <ArrowRight className="w-4 h-4 ml-2" />
+                      </Button>
                     </div>
                   </CardContent>
                 </Card>
@@ -304,6 +326,7 @@ export default function ProjectDetail() {
         return (
           <DeploymentPanel
             deployment={deployment}
+            model={model}
             onDeploy={() => deployModel.mutate("cloud-api")}
             isDeploying={deployModel.isPending}
           />
@@ -311,7 +334,7 @@ export default function ProjectDetail() {
 
       case 6:
         return deployment ? (
-          <IntegrationCode deployment={deployment} />
+          <IntegrationCode deployment={{ ...deployment, templateId: project.templateId } as any} />
         ) : (
           <Card>
             <CardContent className="py-12 text-center">
@@ -330,9 +353,9 @@ export default function ProjectDetail() {
       case 1:
         return true;
       case 2:
-        return labels.length > 0;
+        return isDatasetUploaded || dataset;
       case 3:
-        return true;
+        return pipelineProgress >= (template?.pipelineStages.length || 0);
       case 4:
         return model?.status === "completed";
       case 5:
@@ -345,9 +368,9 @@ export default function ProjectDetail() {
   const getNextButtonLabel = () => {
     switch (currentStep) {
       case 2:
-        return createDataset.isPending ? "Uploading..." : "Upload & Validate";
-      case 3:
         return "Configure Pipeline";
+      case 3:
+        return "Start Training";
       case 4:
         return "Continue to Deploy";
       case 5:
@@ -388,7 +411,7 @@ export default function ProjectDetail() {
         {currentStep < 6 && (
           <Button
             onClick={handleNextStep}
-            disabled={!canProceed() || createDataset.isPending || startTraining.isPending}
+            disabled={!canProceed() || startTraining.isPending}
             data-testid="button-next-step"
           >
             {getNextButtonLabel()}

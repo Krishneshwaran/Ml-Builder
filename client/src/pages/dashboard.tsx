@@ -57,11 +57,10 @@ export default function Dashboard() {
               title="Total Projects"
               value={projects?.length || 0}
               icon={FolderKanban}
-              trend={{ value: 12, positive: true }}
             />
             <StatsCard
               title="Trained Models"
-              value={projects?.filter((p) => p.status === "trained" || p.status === "deployed").length || 0}
+              value={projects?.filter((p) => (p.currentStep ?? 0) >= 5).length || 0}
               icon={Cpu}
             />
             <StatsCard
@@ -73,7 +72,6 @@ export default function Dashboard() {
               title="Total API Requests"
               value={totalRequests.toLocaleString()}
               icon={Activity}
-              trend={{ value: 24, positive: true }}
             />
           </>
         )}

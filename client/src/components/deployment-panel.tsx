@@ -7,10 +7,12 @@ import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
-import type { Deployment } from "@shared/schema";
+import type { Deployment, MlModel } from "@shared/schema";
+import { LiveTester } from "./live-tester";
 
 interface DeploymentPanelProps {
   deployment?: Deployment;
+  model?: MlModel;
   onDeploymentTypeChange?: (type: "cloud-api" | "edge-device") => void;
   onDeploy?: () => void;
   isDeploying?: boolean;
@@ -18,6 +20,7 @@ interface DeploymentPanelProps {
 
 export function DeploymentPanel({
   deployment,
+  model,
   onDeploymentTypeChange,
   onDeploy,
   isDeploying,
@@ -138,8 +141,8 @@ export function DeploymentPanel({
                     deployment.status === "active"
                       ? "bg-chart-2/20 text-chart-2"
                       : deployment.status === "deploying"
-                      ? "bg-chart-3/20 text-chart-3"
-                      : "bg-muted text-muted-foreground"
+                        ? "bg-chart-3/20 text-chart-3"
+                        : "bg-muted text-muted-foreground"
                   )}
                 >
                   {deployment.status === "active" ? "Active" : deployment.status === "deploying" ? "Deploying..." : "Stopped"}
@@ -212,6 +215,8 @@ export function DeploymentPanel({
               Deployed {deployment.deployedAt ? new Date(deployment.deployedAt).toLocaleString() : "N/A"}
             </span>
           </div>
+
+          {model && <LiveTester model={model} deployment={deployment} />}
         </>
       )}
     </div>

@@ -1,4 +1,4 @@
-import { 
+import {
   type User, type InsertUser,
   type Project, type InsertProject,
   type Dataset, type InsertDataset,
@@ -12,20 +12,20 @@ export interface IStorage {
   getUser(id: string): Promise<User | undefined>;
   getUserByUsername(username: string): Promise<User | undefined>;
   createUser(user: InsertUser): Promise<User>;
-  
+
   // Projects
   getProjects(): Promise<Project[]>;
   getProject(id: string): Promise<Project | undefined>;
   createProject(project: InsertProject): Promise<Project>;
   updateProject(id: string, data: Partial<Project>): Promise<Project | undefined>;
   deleteProject(id: string): Promise<boolean>;
-  
+
   // Datasets
   getDataset(projectId: string): Promise<Dataset | undefined>;
   createDataset(dataset: InsertDataset): Promise<Dataset>;
   updateDataset(id: string, data: Partial<Dataset>): Promise<Dataset | undefined>;
   deleteDataset(id: string): Promise<boolean>;
-  
+
   // ML Models
   getModels(): Promise<MlModel[]>;
   getModel(projectId: string): Promise<MlModel | undefined>;
@@ -33,7 +33,7 @@ export interface IStorage {
   createModel(model: InsertMlModel): Promise<MlModel>;
   updateModel(id: string, data: Partial<MlModel>): Promise<MlModel | undefined>;
   deleteModel(id: string): Promise<boolean>;
-  
+
   // Deployments
   getDeployments(): Promise<Deployment[]>;
   getDeployment(projectId: string): Promise<Deployment | undefined>;
@@ -56,7 +56,7 @@ export class MemStorage implements IStorage {
     this.datasets = new Map();
     this.models = new Map();
     this.deployments = new Map();
-    
+
     // Seed some demo data
     this.seedData();
   }
@@ -119,7 +119,7 @@ export class MemStorage implements IStorage {
         name: "Office Access Control API",
         type: "cloud-api",
         status: "active",
-        endpoint: "https://api.mlforge.io/v1/access-control/predict",
+        endpoint: "https://api.AutoML.io/v1/access-control/predict",
         apiKey: "mlf_sk_live_abc123def456ghi789jkl012mno345",
         requestsToday: 1247,
         totalRequests: 45892,
@@ -269,7 +269,7 @@ export class MemStorage implements IStorage {
   async updateProject(id: string, data: Partial<Project>): Promise<Project | undefined> {
     const existing = this.projects.get(id);
     if (!existing) return undefined;
-    
+
     const updated: Project = {
       ...existing,
       ...data,
@@ -304,7 +304,7 @@ export class MemStorage implements IStorage {
   async updateDataset(id: string, data: Partial<Dataset>): Promise<Dataset | undefined> {
     const existing = this.datasets.get(id);
     if (!existing) return undefined;
-    
+
     const updated: Dataset = {
       ...existing,
       ...data,
@@ -346,7 +346,7 @@ export class MemStorage implements IStorage {
   async updateModel(id: string, data: Partial<MlModel>): Promise<MlModel | undefined> {
     const existing = this.models.get(id);
     if (!existing) return undefined;
-    
+
     const updated: MlModel = {
       ...existing,
       ...data,
@@ -388,7 +388,7 @@ export class MemStorage implements IStorage {
   async updateDeployment(id: string, data: Partial<Deployment>): Promise<Deployment | undefined> {
     const existing = this.deployments.get(id);
     if (!existing) return undefined;
-    
+
     const updated: Deployment = {
       ...existing,
       ...data,
