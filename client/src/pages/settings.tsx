@@ -45,6 +45,25 @@ export default function Settings() {
     });
   };
 
+  const applyInstalledModel = (modelName: string) => {
+    const nextSettings = { ...settings, llmModel: modelName };
+    setSettings(nextSettings);
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(nextSettings));
+    setLlmStatus((prev) =>
+      prev
+        ? {
+            ...prev,
+            modelAvailable: true,
+            message: `Using installed Ollama model ${modelName}.`,
+          }
+        : prev,
+    );
+    toast({
+      title: "Model updated",
+      description: `${modelName} is now selected for local LLM usage.`,
+    });
+  };
+
   const testLlmConnection = async () => {
     setIsTestingLlm(true);
     setLlmStatus(null);
@@ -340,6 +359,22 @@ export default function Settings() {
                 <p className="text-xs text-muted-foreground">
                   Installed Ollama models: {llmStatus.availableModels.join(", ")}
                 </p>
+              )}
+              {!llmStatus.modelAvailable && llmStatus.availableModels.length > 0 && (
+                <div className="flex flex-wrap gap-2 pt-2">
+                  {llmStatus.availableModels.map((modelName) => (
+                    <Button
+                      key={modelName}
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => applyInstalledModel(modelName)}
+                      data-testid={`button-use-installed-model-${modelName.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`}
+                    >
+                      Use {modelName}
+                    </Button>
+                  ))}
+                </div>
               )}
             </div>
           )}

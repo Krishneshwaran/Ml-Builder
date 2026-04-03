@@ -9,9 +9,11 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import time
 import uuid
 import zipfile
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
@@ -23,6 +25,7 @@ from urllib import request as urllib_request
 import joblib
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -37,6 +40,7 @@ from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
 logger = logging.getLogger("AutoML")
 
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 MODELS_DIR = BASE_DIR / "storage" / "models"
 DATASETS_DIR = BASE_DIR / "storage" / "datasets"
 KAGGLE_DIR = DATASETS_DIR / "kaggle"
@@ -49,10 +53,31 @@ for directory in (MODELS_DIR, DATASETS_DIR, KAGGLE_DIR, UPLOADS_DIR, PROMPT_DATA
     directory.mkdir(parents=True, exist_ok=True)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+PROMPT_ENROLLMENT_IMAGE_EXTENSIONS = IMAGE_EXTENSIONS
+VALID_TEMPLATE_IDS = {
+    "access-control",
+    "exam-proctoring",
+    "waste-sorting",
+    "retail-analytics",
+    "document-processing",
+    "crowd-monitoring",
+}
 
 
 class DatasetImportRequest(BaseModel):
     kaggleUrl: str
+
+
+class LlmProjectBuildRequest(BaseModel):
+    prompt: str
+    provider: str = "ollama"
+    baseUrl: str = "http://localhost:11434"
+    model: str = ""
+    preferGpu: bool = False
+    baseModel: str = "resnet18"
+    usePretrainedWeights: bool = False
+    trainingEpochs: int = 12
+    useImageAugmentation: bool = True
 
 
 def get_conn():
@@ -593,6 +618,14 @@ def delete_project_resources(project_id: str) -> bool:
     return True
 
 
+def safe_delete_project_resources(project_id: str) -> bool:
+    try:
+        return delete_project_resources(project_id)
+    except sqlite3.Error:
+        logger.exception("Project cleanup failed for %s", project_id)
+        return False
+
+
 def upsert_prompt_dataset_record(project_id: str, local_path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
     conn = get_conn()
     existing = conn.execute(
@@ -655,10 +688,7 @@ def upsert_prompt_dataset_record(project_id: str, local_path: Path, metadata: di
 
 
 def check_ollama_connection(base_url: str, model_name: str) -> dict[str, Any]:
-    tags_url = urllib_parse.urljoin(base_url.rstrip("/") + "/", "api/tags")
-    request = urllib_request.Request(tags_url, method="GET")
-    with urllib_request.urlopen(request, timeout=5) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    payload = fetch_ollama_tags(base_url)
     models = payload.get("models", []) if isinstance(payload, dict) else []
     available_models = sorted([str(model.get("name")) for model in models if model.get("name")])
     return {
@@ -667,6 +697,526 @@ def check_ollama_connection(base_url: str, model_name: str) -> dict[str, Any]:
         "availableModels": available_models,
         "message": f"Connected to Ollama at {base_url}.",
     }
+
+
+def fetch_ollama_tags(base_url: str) -> dict[str, Any]:
+    tags_url = urllib_parse.urljoin(base_url.rstrip("/") + "/", "api/tags")
+    request = urllib_request.Request(tags_url, method="GET")
+    with urllib_request.urlopen(request, timeout=5) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def post_json_request(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None, timeout: int = 30) -> dict[str, Any]:
+    encoded_payload = json.dumps(payload).encode("utf-8")
+    request_headers = {"Content-Type": "application/json", **(headers or {})}
+    request = urllib_request.Request(url, data=encoded_payload, headers=request_headers, method="POST")
+    with urllib_request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def normalize_lookup_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def dedupe_string_values(values: list[Any]) -> list[str]:
+    unique_values: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = re.sub(r"\s+", " ", str(value or "").strip())
+        if not cleaned:
+            continue
+        lookup_key = cleaned.lower()
+        if lookup_key in seen:
+            continue
+        seen.add(lookup_key)
+        unique_values.append(cleaned)
+    return unique_values
+
+
+def strip_markdown_code_fences(value: str) -> str:
+    cleaned = (value or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def parse_json_object_from_text(value: str) -> dict[str, Any]:
+    cleaned = strip_markdown_code_fences(value)
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        parsed = json.loads(cleaned[start : end + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("Expected a JSON object")
+    return parsed
+
+
+def get_cuda_runtime_status() -> dict[str, Any]:
+    try:
+        import torch
+
+        cuda_available = bool(torch.cuda.is_available())
+        return {
+            "torchAvailable": True,
+            "cudaAvailable": cuda_available,
+            "gpuName": torch.cuda.get_device_name(0) if cuda_available else None,
+        }
+    except Exception as exc:
+        return {
+            "torchAvailable": False,
+            "cudaAvailable": False,
+            "gpuName": None,
+            "torchError": str(exc),
+        }
+
+
+def get_system_resource_usage() -> dict[str, Any]:
+    resource_usage: dict[str, Any] = {
+        "cpu": {"usagePercent": None},
+        "memory": {"usedGb": None, "totalGb": None, "usagePercent": None},
+        "gpus": [],
+    }
+
+    try:
+        cpu_command = [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "(Get-Counter '\\Processor(_Total)\\% Processor Time').CounterSamples[0].CookedValue",
+        ]
+        cpu_output = subprocess.check_output(cpu_command, stderr=subprocess.DEVNULL, timeout=5, text=True).strip()
+        resource_usage["cpu"]["usagePercent"] = round(float(cpu_output), 1)
+    except Exception:
+        pass
+
+    try:
+        memory_command = [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory | ConvertTo-Json -Compress",
+        ]
+        memory_output = subprocess.check_output(memory_command, stderr=subprocess.DEVNULL, timeout=5, text=True).strip()
+        memory_payload = json.loads(memory_output)
+        total_kb = float(memory_payload.get("TotalVisibleMemorySize") or 0)
+        free_kb = float(memory_payload.get("FreePhysicalMemory") or 0)
+        if total_kb > 0:
+            used_kb = max(total_kb - free_kb, 0.0)
+            resource_usage["memory"] = {
+                "usedGb": round(used_kb / (1024 * 1024), 2),
+                "totalGb": round(total_kb / (1024 * 1024), 2),
+                "usagePercent": round((used_kb / total_kb) * 100, 1),
+            }
+    except Exception:
+        pass
+
+    try:
+        gpu_command = [
+            "nvidia-smi",
+            "--query-gpu=index,name,utilization.gpu,memory.total,memory.used,memory.free,temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ]
+        gpu_output = subprocess.check_output(gpu_command, stderr=subprocess.DEVNULL, timeout=5, text=True).strip()
+        gpus: list[dict[str, Any]] = []
+        for line in gpu_output.splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) < 7:
+                continue
+            try:
+                total_mb = float(parts[3])
+                used_mb = float(parts[4])
+                free_mb = float(parts[5])
+            except ValueError:
+                total_mb = used_mb = free_mb = 0.0
+            gpus.append(
+                {
+                    "index": parts[0],
+                    "name": parts[1],
+                    "usagePercent": float(parts[2]) if parts[2] else None,
+                    "memoryTotalGb": round(total_mb / 1024, 2) if total_mb else 0.0,
+                    "memoryUsedGb": round(used_mb / 1024, 2) if used_mb else 0.0,
+                    "memoryFreeGb": round(free_mb / 1024, 2) if free_mb else 0.0,
+                    "memoryUsagePercent": round((used_mb / total_mb) * 100, 1) if total_mb else None,
+                    "temperatureC": float(parts[6]) if parts[6] else None,
+                }
+            )
+        resource_usage["gpus"] = gpus
+    except Exception:
+        pass
+
+    return resource_usage
+
+
+def infer_project_plan_from_prompt(prompt: str) -> dict[str, Any]:
+    cleaned_prompt = re.sub(r"\s+", " ", prompt or "").strip()
+    normalized_prompt = normalize_lookup_text(cleaned_prompt)
+    default_plan = {
+        "projectName": "Auto-Built Vision Project",
+        "projectDescription": cleaned_prompt or "Auto-created image-classification project from LLM Studio.",
+        "templateId": "waste-sorting",
+        "taskType": "image-classification",
+        "desiredLabels": [],
+        "searchQueries": [
+            cleaned_prompt,
+            f"{cleaned_prompt} image classification dataset" if cleaned_prompt else "image classification dataset",
+        ],
+        "strictLabelMatch": False,
+        "planningMode": "heuristic",
+    }
+
+    if any(term in normalized_prompt for term in ("biodegradable", "bio degradable")):
+        return {
+            "projectName": "Biodegradable vs Non-Biodegradable Waste",
+            "projectDescription": "Classify waste images into biodegradable and non-biodegradable categories with local GPU-friendly training.",
+            "templateId": "waste-sorting",
+            "taskType": "image-classification",
+            "desiredLabels": ["biodegradable", "non_biodegradable"],
+            "searchQueries": [
+                "biodegradable non biodegradable waste classification images",
+                "biodegradable and non biodegradable waste dataset",
+                "waste classification biodegradable non biodegradable images",
+                cleaned_prompt,
+            ],
+            "strictLabelMatch": True,
+            "planningMode": "heuristic",
+        }
+
+    if any(term in normalized_prompt for term in ("face", "person", "identity", "employee", "visitor", "recognize")):
+        return {
+            "projectName": "Person Identification Project",
+            "projectDescription": "Recognize enrolled people from images using a local image-classification model.",
+            "templateId": "access-control",
+            "taskType": "image-classification",
+            "desiredLabels": [],
+            "searchQueries": [
+                cleaned_prompt,
+                "face recognition people image classification dataset",
+            ],
+            "strictLabelMatch": False,
+            "planningMode": "heuristic",
+        }
+
+    if any(term in normalized_prompt for term in ("document", "invoice", "receipt", "pdf", "form")):
+        return {
+            "projectName": "Document Classification Project",
+            "projectDescription": "Classify document images by type with a locally trained image model.",
+            "templateId": "document-processing",
+            "taskType": "image-classification",
+            "desiredLabels": [],
+            "searchQueries": [
+                cleaned_prompt,
+                "document image classification dataset",
+            ],
+            "strictLabelMatch": False,
+            "planningMode": "heuristic",
+        }
+
+    return default_plan
+
+
+def infer_project_plan_with_ollama(prompt: str, provider: str, base_url: str, model_name: str) -> dict[str, Any] | None:
+    if provider != "ollama" or not model_name.strip():
+        return None
+
+    system_prompt = (
+        "You convert plain-English ML requests into a strict JSON plan for a local image-classification project. "
+        "Return JSON only with keys projectName, projectDescription, templateId, taskType, desiredLabels, searchQueries, strictLabelMatch. "
+        "templateId must be one of access-control, exam-proctoring, waste-sorting, retail-analytics, document-processing, crowd-monitoring. "
+        "taskType must be image-classification. desiredLabels should be short lowercase label slugs when the user clearly names target classes. "
+        "searchQueries should be short Kaggle-friendly search strings for public image datasets."
+    )
+    planner_prompt = (
+        "User request:\n"
+        f"{prompt.strip()}\n\n"
+        "Return a single JSON object only."
+    )
+    generate_url = urllib_parse.urljoin(base_url.rstrip("/") + "/", "api/generate")
+    payload = {
+        "model": model_name.strip(),
+        "system": system_prompt,
+        "prompt": planner_prompt,
+        "stream": False,
+    }
+    response = post_json_request(generate_url, payload, timeout=15)
+    content = str(response.get("response") or "").strip()
+    if not content:
+        return None
+    parsed = parse_json_object_from_text(content)
+    parsed["planningMode"] = "ollama"
+    return parsed
+
+
+def normalize_project_plan(candidate_plan: dict[str, Any] | None, fallback_plan: dict[str, Any]) -> dict[str, Any]:
+    candidate = candidate_plan or {}
+    template_id = str(candidate.get("templateId") or fallback_plan["templateId"]).strip()
+    if template_id not in VALID_TEMPLATE_IDS:
+        template_id = fallback_plan["templateId"]
+
+    project_name = str(candidate.get("projectName") or fallback_plan["projectName"]).strip()[:120]
+    if not project_name:
+        project_name = fallback_plan["projectName"]
+
+    project_description = str(candidate.get("projectDescription") or fallback_plan["projectDescription"]).strip()[:300]
+    if not project_description:
+        project_description = fallback_plan["projectDescription"]
+
+    raw_desired_labels = candidate.get("desiredLabels")
+    desired_labels_source = raw_desired_labels if isinstance(raw_desired_labels, list) else fallback_plan.get("desiredLabels", [])
+    desired_labels = [
+        sanitize_label_name(str(label)).lower()
+        for label in desired_labels_source
+        if str(label or "").strip()
+    ]
+    desired_labels = dedupe_string_values(desired_labels)
+
+    raw_search_queries = candidate.get("searchQueries")
+    candidate_queries = raw_search_queries if isinstance(raw_search_queries, list) else []
+    search_queries = dedupe_string_values(candidate_queries + list(fallback_plan.get("searchQueries", [])))
+    if not search_queries:
+        search_queries = [project_name]
+
+    return {
+        "projectName": project_name,
+        "projectDescription": project_description,
+        "templateId": template_id,
+        "taskType": "image-classification",
+        "desiredLabels": desired_labels,
+        "searchQueries": search_queries[:3],
+        "strictLabelMatch": bool(candidate.get("strictLabelMatch", fallback_plan.get("strictLabelMatch", False))),
+        "planningMode": str(candidate.get("planningMode") or fallback_plan.get("planningMode") or "heuristic"),
+    }
+
+
+def summarize_kaggle_candidate(item: Any) -> dict[str, Any]:
+    return {
+        "ref": str(getattr(item, "ref", "") or "").strip(),
+        "title": str(getattr(item, "title", "") or "").strip(),
+        "size": getattr(item, "totalBytes", None),
+        "lastUpdated": getattr(item, "lastUpdated", None),
+        "downloadCount": getattr(item, "downloadCount", None),
+        "voteCount": getattr(item, "voteCount", None),
+    }
+
+
+def search_kaggle_datasets(search_query: str, limit: int = 3) -> list[dict[str, Any]]:
+    from kaggle.api.kaggle_api_extended import KaggleApi
+
+    try:
+        api = KaggleApi()
+        api.authenticate()
+        results = api.dataset_list(search=search_query, sort_by="votes", page=1)
+    except Exception as exc:
+        raise HTTPException(
+            400,
+            f"Kaggle search failed. Set KAGGLE_USERNAME and KAGGLE_KEY in backend/.env or ~/.kaggle/kaggle.json. Details: {exc}",
+        ) from exc
+
+    summaries: list[dict[str, Any]] = []
+    for item in list(results)[:limit]:
+        summary = summarize_kaggle_candidate(item)
+        if summary["ref"]:
+            summaries.append(summary)
+    return summaries
+
+
+def download_kaggle_dataset_ref(dataset_ref: str, dataset_id: str) -> tuple[Path, dict[str, Any]]:
+    from kaggle.api.kaggle_api_extended import KaggleApi
+
+    target_dir = KAGGLE_DIR / dataset_id
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        api = KaggleApi()
+        api.authenticate()
+        api.dataset_download_files(dataset_ref, path=str(target_dir), unzip=True, quiet=False)
+    except Exception as exc:
+        raise HTTPException(
+            400,
+            f"Kaggle download failed. Set KAGGLE_USERNAME and KAGGLE_KEY in backend/.env or ~/.kaggle/kaggle.json. Details: {exc}",
+        ) from exc
+    return target_dir, resolve_image_dataset(target_dir)
+
+
+def count_label_matches(actual_labels: list[str], desired_labels: list[str]) -> tuple[int, list[str]]:
+    normalized_actual = [normalize_lookup_text(label) for label in actual_labels]
+    matched_labels: list[str] = []
+    for desired_label in desired_labels:
+        normalized_target = normalize_lookup_text(desired_label)
+        if not normalized_target:
+            continue
+        target_tokens = set(normalized_target.split())
+        for actual_label in normalized_actual:
+            actual_tokens = set(actual_label.split())
+            if (
+                normalized_target == actual_label
+                or normalized_target in actual_label
+                or actual_label in normalized_target
+                or (target_tokens and target_tokens.issubset(actual_tokens))
+            ):
+                matched_labels.append(desired_label)
+                break
+    return len(matched_labels), matched_labels
+
+
+def rank_kaggle_candidate(candidate: dict[str, Any], plan: dict[str, Any]) -> int:
+    title_lookup = normalize_lookup_text(f"{candidate.get('title')} {candidate.get('ref')}")
+    score = 0
+    detection_terms = {
+        "detection",
+        "detector",
+        "object detection",
+        "bounding box",
+        "bounding boxes",
+        "yolo",
+        "coco",
+        "segmentation",
+        "instance segmentation",
+        "annotation",
+        "annotations",
+        "labelme",
+        "roboflow",
+    }
+    try:
+        score += int(candidate.get("voteCount") or 0) * 3
+    except (TypeError, ValueError):
+        pass
+    try:
+        score += min(int(candidate.get("downloadCount") or 0) // 250, 80)
+    except (TypeError, ValueError):
+        pass
+
+    for desired_label in plan.get("desiredLabels", []):
+        normalized_label = normalize_lookup_text(desired_label)
+        if normalized_label and normalized_label in title_lookup:
+            score += 120
+
+    for search_query in plan.get("searchQueries", []):
+        normalized_query = normalize_lookup_text(search_query)
+        if not normalized_query:
+            continue
+        if normalized_query in title_lookup:
+            score += 80
+        elif any(token in title_lookup for token in normalized_query.split() if len(token) > 3):
+            score += 20
+
+    if plan.get("taskType") == "image-classification":
+        if "classification" in title_lookup:
+            score += 90
+        if any(term in title_lookup for term in detection_terms):
+            score -= 250
+    return score
+
+
+def select_kaggle_dataset_for_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    search_queries = [query for query in plan.get("searchQueries", []) if str(query or "").strip()]
+    if not search_queries:
+        raise HTTPException(400, "No dataset search queries were generated for this request")
+
+    candidates_by_ref: dict[str, dict[str, Any]] = {}
+    for search_query in search_queries:
+        for candidate in search_kaggle_datasets(search_query):
+            dataset_ref = candidate["ref"]
+            existing = candidates_by_ref.get(dataset_ref)
+            candidate_payload = {
+                **candidate,
+                "searchQuery": search_query,
+            }
+            if existing is None or rank_kaggle_candidate(candidate_payload, plan) > rank_kaggle_candidate(existing, plan):
+                candidates_by_ref[dataset_ref] = candidate_payload
+
+    ranked_candidates = sorted(
+        candidates_by_ref.values(),
+        key=lambda candidate: rank_kaggle_candidate(candidate, plan),
+        reverse=True,
+    )
+    if not ranked_candidates:
+        raise HTTPException(400, "No Kaggle datasets matched the generated search plan")
+
+    attempts: list[str] = []
+    for candidate in ranked_candidates[:3]:
+        dataset_id = str(uuid.uuid4())
+        target_dir: Path | None = None
+        try:
+            candidate_lookup = normalize_lookup_text(f"{candidate.get('title')} {candidate.get('ref')}")
+            if plan.get("taskType") == "image-classification" and any(
+                blocked_term in candidate_lookup
+                for blocked_term in ("object detection", "detection", "yolo", "segmentation", "bounding box", "annotations")
+            ):
+                attempts.append(f"{candidate['ref']}: skipped because it looks like a detection dataset, not image classification.")
+                continue
+            target_dir, metadata = download_kaggle_dataset_ref(candidate["ref"], dataset_id)
+            desired_labels = plan.get("desiredLabels", [])
+            exact_match_count, matched_labels = count_label_matches(metadata.get("labels", []), desired_labels)
+            if plan.get("strictLabelMatch") and desired_labels and exact_match_count < len(desired_labels):
+                remove_path_if_exists(str(target_dir))
+                attempts.append(
+                    f"{candidate['ref']} was downloaded but labels {metadata.get('labels', [])} did not match required labels {desired_labels}."
+                )
+                continue
+            selection = {
+                **candidate,
+                "datasetId": dataset_id,
+                "localPath": str(target_dir),
+                "sourceUrl": f"https://www.kaggle.com/datasets/{candidate['ref']}",
+                "metadata": metadata,
+                "matchedLabels": matched_labels,
+            }
+            return selection
+        except HTTPException as exc:
+            if target_dir is not None:
+                remove_path_if_exists(str(target_dir))
+            attempts.append(f"{candidate['ref']}: {exc.detail}")
+        except Exception as exc:
+            if target_dir is not None:
+                remove_path_if_exists(str(target_dir))
+            attempts.append(f"{candidate['ref']}: {exc}")
+
+    raise HTTPException(
+        400,
+        "Auto dataset import could not find a usable Kaggle image dataset. "
+        + " ".join(attempts[:3]),
+    )
+
+
+def estimate_training_epochs(prompt: str, metadata: dict[str, Any], requested_epochs: int | None = None) -> tuple[int, str]:
+    if requested_epochs is not None and requested_epochs > 0:
+        epochs = max(1, min(int(requested_epochs), 50))
+        return epochs, f"Using explicitly requested {epochs} training epochs."
+
+    image_count = int(metadata.get("metadata", {}).get("imageCount") or metadata.get("file_count") or 0)
+    label_count = int(metadata.get("label_count") or len(metadata.get("labels", [])) or 2)
+    normalized_prompt = normalize_lookup_text(prompt)
+
+    if image_count <= 250:
+        epochs = 12
+        reason = "Small dataset detected, so training still needs a healthy number of passes."
+    elif image_count <= 1000:
+        epochs = 8
+        reason = "Medium dataset detected, so a faster balanced epoch count was chosen."
+    elif image_count <= 3000:
+        epochs = 5
+        reason = "Larger dataset detected, so epoch count was reduced to keep runtime practical."
+    else:
+        epochs = 3
+        reason = "Very large dataset detected, so the default run was shortened for faster turnaround."
+
+    if label_count >= 6:
+        epochs += 1
+        reason += " More classes were found, so one extra epoch was added."
+    if any(token in normalized_prompt for token in ("quick", "fast", "demo", "prototype")):
+        epochs = max(2, epochs - 2)
+        reason += " The prompt asked for a fast run, so epochs were reduced."
+    if any(token in normalized_prompt for token in ("best", "accurate", "accuracy", "high quality", "production")):
+        epochs = min(18, epochs + 3)
+        reason += " The prompt asked for stronger quality, so epochs were increased."
+
+    return max(2, min(epochs, 18)), reason
 
 
 def extract_zip_dataset(zip_path: Path, dataset_id: str) -> tuple[Path, dict[str, Any]]:
@@ -686,23 +1236,8 @@ def extract_zip_dataset(zip_path: Path, dataset_id: str) -> tuple[Path, dict[str
 
 
 def download_kaggle_dataset(kaggle_url: str, dataset_id: str) -> tuple[Path, dict[str, Any]]:
-    from kaggle.api.kaggle_api_extended import KaggleApi
-
     dataset_ref = parse_kaggle_ref(kaggle_url)
-    target_dir = KAGGLE_DIR / dataset_id
-    if target_dir.exists():
-        shutil.rmtree(target_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        api = KaggleApi()
-        api.authenticate()
-        api.dataset_download_files(dataset_ref, path=str(target_dir), unzip=True, quiet=False)
-    except Exception as exc:
-        raise HTTPException(
-            400,
-            f"Kaggle download failed. Set KAGGLE_USERNAME and KAGGLE_KEY in backend/.env or ~/.kaggle/kaggle.json. Details: {exc}",
-        ) from exc
-    return target_dir, resolve_image_dataset(target_dir)
+    return download_kaggle_dataset_ref(dataset_ref, dataset_id)
 
 
 def train_tabular_model(df: pd.DataFrame, template_id: str, label_column: str) -> tuple[Any, Any, dict[str, Any]]:
@@ -909,22 +1444,35 @@ def train_image_model(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device_label = torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU"
-    batch_size = 24 if device.type == "cuda" else 12
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+    batch_size = 32 if device.type == "cuda" and base_model in {"resnet18", "mobilenet_v3_small"} else 16 if device.type == "cuda" else 12
     epochs = max(1, min(int(training_epochs), 50))
+    cpu_count = os.cpu_count() or 2
+    num_workers = min(8, max(2, cpu_count - 1)) if device.type == "cuda" else min(4, max(1, cpu_count - 1))
+    loader_kwargs: dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
     class_counts = np.bincount(np.asarray(train_targets, dtype=np.int64), minlength=len(class_names))
     class_weights = np.asarray([1.0 / max(1, count) for count in class_counts], dtype=np.float32)
     sample_weights = [float(class_weights[int(target)]) for target in train_targets]
     sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, **loader_kwargs)
+    eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
     model, algorithm_name = build_image_model(base_model, len(class_names), use_pretrained_weights)
     model = model.to(device)
     criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32, device=device), label_smoothing=0.05)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4 if use_pretrained_weights else 7e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=2)
+    use_amp = device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     def run_eval(loader):
         model.eval()
@@ -933,9 +1481,11 @@ def train_image_model(
         confidences: list[float] = []
         with torch.no_grad():
             for images, labels in loader:
-                images = images.to(device)
-                labels = labels.to(device)
-                logits = model(images)
+                images = images.to(device, non_blocking=use_amp)
+                labels = labels.to(device, non_blocking=use_amp)
+                autocast_context = torch.cuda.amp.autocast() if use_amp else nullcontext()
+                with autocast_context:
+                    logits = model(images)
                 probabilities = torch.softmax(logits, dim=1)
                 preds = torch.argmax(probabilities, dim=1)
                 predictions.extend(preds.cpu().tolist())
@@ -945,6 +1495,7 @@ def train_image_model(
 
     progress_callback(15, "Building image tensors and data loaders")
     progress_callback(18, f"Class balance in training split: {class_counts.tolist()}")
+    progress_callback(19, f"Loader config: batch_size={batch_size}, workers={num_workers}, amp={'enabled' if use_amp else 'disabled'}")
     best_state_dict = copy.deepcopy(model.state_dict())
     best_val_accuracy = -1.0
     best_epoch = 0
@@ -953,13 +1504,16 @@ def train_image_model(
         epoch_loss_total = 0.0
         epoch_items = 0
         for batch_index, (images, labels) in enumerate(train_loader):
-            images = images.to(device)
-            labels = labels.to(device)
+            images = images.to(device, non_blocking=use_amp)
+            labels = labels.to(device, non_blocking=use_amp)
             optimizer.zero_grad(set_to_none=True)
-            logits = model(images)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
+            autocast_context = torch.cuda.amp.autocast() if use_amp else nullcontext()
+            with autocast_context:
+                logits = model(images)
+                loss = criterion(logits, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             epoch_loss_total += float(loss.item()) * len(labels)
             epoch_items += len(labels)
             batch_progress = int(((epoch + (batch_index + 1) / max(1, len(train_loader))) / epochs) * 55)
@@ -1293,6 +1847,11 @@ def get_system_capabilities():
     return capabilities
 
 
+@app.get("/api/system/resource-usage")
+def get_resource_usage():
+    return get_system_resource_usage()
+
+
 @app.post("/api/system/llm/check")
 async def check_llm_connection(req: Request):
     body = await req.json()
@@ -1323,6 +1882,266 @@ async def check_llm_connection(req: Request):
             raise HTTPException(400, f"LLM connection check failed: {exc}") from exc
 
     raise HTTPException(400, f"Unsupported LLM provider: {provider}")
+
+
+@app.get("/api/system/llm/models")
+def list_llm_models(provider: str = "ollama", baseUrl: str = "http://localhost:11434"):
+    if provider != "ollama":
+        raise HTTPException(400, f"Unsupported LLM provider: {provider}")
+
+    try:
+        payload = fetch_ollama_tags(baseUrl)
+        models = payload.get("models", []) if isinstance(payload, dict) else []
+        return {
+            "provider": provider,
+            "baseUrl": baseUrl,
+            "models": [
+                {
+                    "name": model.get("name"),
+                    "size": model.get("size"),
+                    "modifiedAt": model.get("modified_at"),
+                }
+                for model in models
+                if model.get("name")
+            ],
+        }
+    except urllib_error.HTTPError as exc:
+        raise HTTPException(exc.code, f"Ollama returned HTTP {exc.code}") from exc
+    except urllib_error.URLError as exc:
+        raise HTTPException(400, f"Could not reach Ollama at {baseUrl}: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise HTTPException(400, f"Ollama did not respond in time at {baseUrl}") from exc
+    except Exception as exc:
+        raise HTTPException(400, f"Unable to list Ollama models: {exc}") from exc
+
+
+@app.post("/api/system/llm/build-project")
+async def build_project_from_prompt(payload: LlmProjectBuildRequest):
+    prompt = re.sub(r"\s+", " ", payload.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(400, "Describe the project you want to build in plain English")
+
+    build_log: list[str] = [f"$ prompt: {prompt}"]
+    fallback_plan = infer_project_plan_from_prompt(prompt)
+    llm_plan: dict[str, Any] | None = None
+    llm_warning: str | None = None
+    should_try_llm_plan = fallback_plan["projectName"] == "Auto-Built Vision Project"
+    if should_try_llm_plan:
+        try:
+            llm_plan = infer_project_plan_with_ollama(prompt, payload.provider, payload.baseUrl, payload.model)
+            if llm_plan:
+                build_log.append(f"> planner: using Ollama model {payload.model or 'unknown'} to shape the project plan")
+        except Exception as exc:
+            llm_warning = f"LLM planning fell back to heuristics: {exc}"
+            build_log.append(f"! planner warning: {llm_warning}")
+    else:
+        build_log.append("> planner: using fast heuristic template selection for a known project type")
+
+    project_plan = normalize_project_plan(llm_plan, fallback_plan)
+    build_log.append(f"> template: {project_plan['templateId']}")
+    build_log.append(f"> search queries: {', '.join(project_plan['searchQueries'])}")
+    if project_plan["taskType"] != "image-classification":
+        raise HTTPException(400, "Auto build currently supports image-classification projects only.")
+
+    ensure_database_ready()
+    runtime_status = get_cuda_runtime_status()
+    if runtime_status.get("cudaAvailable"):
+        build_log.append(f"> runtime: CUDA available on {runtime_status.get('gpuName') or 'GPU'}")
+    else:
+        build_log.append("> runtime: CUDA not available, CPU fallback will be used unless GPU-required mode is enabled")
+    if payload.preferGpu and not runtime_status.get("cudaAvailable"):
+        raise HTTPException(
+            400,
+            "GPU-required mode was requested, but CUDA is not available on this machine. Disable GPU-only mode or install a CUDA-ready PyTorch setup first.",
+        )
+
+    dataset_selection = select_kaggle_dataset_for_plan(project_plan)
+    dataset_id = str(dataset_selection["datasetId"])
+    dataset_metadata = dataset_selection["metadata"]
+    dataset_name = dataset_selection.get("title") or dataset_selection["ref"].split("/")[-1]
+    build_log.append(f"> dataset: selected {dataset_selection['ref']}")
+    build_log.append(f"> labels: {', '.join(dataset_metadata.get('labels', []))}")
+    project_id = str(uuid.uuid4())
+    model_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    requested_epochs = int(payload.trainingEpochs) if payload.trainingEpochs and int(payload.trainingEpochs) > 0 else None
+    training_epochs, epoch_reason = estimate_training_epochs(prompt, dataset_metadata, requested_epochs)
+    build_log.append(f"> epochs: {training_epochs} ({epoch_reason})")
+    conn: sqlite3.Connection | None = None
+    project_row: dict[str, Any] | None = None
+    dataset_row: dict[str, Any] | None = None
+    model_row: dict[str, Any] | None = None
+
+    try:
+        conn = get_conn()
+        conn.execute(
+            """
+            INSERT INTO projects (id, name, description, template_id, status, current_step, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                project_plan["projectName"],
+                project_plan["projectDescription"],
+                project_plan["templateId"],
+                "training",
+                4,
+                now,
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO datasets (
+                id, project_id, name, file_count, total_size, data_type, label_count, is_validated,
+                labels, created_at, source_type, source_url, local_path, task_type, metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                dataset_id,
+                project_id,
+                dataset_name,
+                dataset_metadata["file_count"],
+                dataset_metadata["total_size"],
+                dataset_metadata["data_type"],
+                dataset_metadata["label_count"],
+                1,
+                json.dumps(dataset_metadata["labels"]),
+                now,
+                "kaggle",
+                dataset_selection["sourceUrl"],
+                dataset_selection["localPath"],
+                dataset_metadata["task_type"],
+                json.dumps(dataset_metadata["metadata"]),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO ml_models (
+                id, project_id, name, status, confidence_threshold, training_progress, created_at,
+                base_model, prefer_gpu, use_pretrained_weights, training_epochs, use_image_augmentation
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                model_id,
+                project_id,
+                f"{project_plan['projectName']} Model"[:140],
+                "training",
+                80,
+                0,
+                now,
+                payload.baseModel,
+                int(bool(payload.preferGpu)),
+                int(bool(payload.usePretrainedWeights)),
+                training_epochs,
+                int(bool(payload.useImageAugmentation)),
+            ),
+        )
+        project_row = row_to_dict(conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone())
+        dataset_row = row_to_dict(conn.execute("SELECT * FROM datasets WHERE id = ?", (dataset_id,)).fetchone())
+        model_row = row_to_dict(conn.execute("SELECT * FROM ml_models WHERE id = ?", (model_id,)).fetchone())
+        conn.commit()
+        conn.close()
+        build_log.append(f"> project: created {project_plan['projectName']}")
+        build_log.append("> training: background training job started")
+    except Exception as exc:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+        safe_delete_project_resources(project_id)
+        remove_path_if_exists(dataset_selection["localPath"])
+        raise HTTPException(500, f"Could not create the auto-built project because the local database write failed: {exc}") from exc
+
+    Thread(target=run_training_job, args=(model_id, project_id), daemon=True).start()
+    message = (
+        f"Created '{project_plan['projectName']}', downloaded {dataset_selection['ref']}, and started local training. "
+        f"Training will use CUDA automatically when available{' and fail if CUDA is missing because GPU-required mode is enabled' if payload.preferGpu else ''}."
+    )
+
+    return {
+        "message": message,
+        "project": clean_dict(serialize_row(project_row)),
+        "dataset": clean_dict(serialize_row(dataset_row)),
+        "model": clean_dict(serialize_row(model_row)),
+        "buildPlan": project_plan,
+        "llmWarning": llm_warning,
+        "buildLog": build_log,
+        "datasetSelection": {
+            "ref": dataset_selection["ref"],
+            "title": dataset_selection.get("title"),
+            "searchQuery": dataset_selection.get("searchQuery"),
+            "voteCount": dataset_selection.get("voteCount"),
+            "downloadCount": dataset_selection.get("downloadCount"),
+            "sourceUrl": dataset_selection["sourceUrl"],
+            "labels": dataset_metadata.get("labels", []),
+            "matchedLabels": dataset_selection.get("matchedLabels", []),
+        },
+        "runtime": runtime_status,
+        "trainingSettings": {
+            "preferGpu": bool(payload.preferGpu),
+            "baseModel": payload.baseModel,
+            "trainingEpochs": training_epochs,
+            "autoAssignedEpochs": requested_epochs is None,
+            "epochReason": epoch_reason,
+            "usePretrainedWeights": bool(payload.usePretrainedWeights),
+            "useImageAugmentation": bool(payload.useImageAugmentation),
+        },
+    }
+
+
+@app.post("/api/system/llm/run")
+async def run_llm_prompt(req: Request):
+    body = await req.json()
+    provider = str(body.get("provider") or "disabled")
+    base_url = str(body.get("baseUrl") or "http://localhost:11434").strip()
+    model_name = str(body.get("model") or "").strip()
+    system_prompt = str(body.get("systemPrompt") or "").strip()
+    user_prompt = str(body.get("prompt") or "").strip()
+    temperature = body.get("temperature")
+
+    if not user_prompt:
+        raise HTTPException(400, "Prompt is required")
+    if provider != "ollama":
+        raise HTTPException(400, "Only Ollama is supported for local LLM execution right now")
+    if not model_name:
+        raise HTTPException(400, "Model name is required")
+
+    generate_url = urllib_parse.urljoin(base_url.rstrip("/") + "/", "api/generate")
+    payload: dict[str, Any] = {
+        "model": model_name,
+        "prompt": user_prompt,
+        "stream": False,
+    }
+    if system_prompt:
+        payload["system"] = system_prompt
+    if temperature is not None:
+        payload["options"] = {"temperature": temperature}
+
+    try:
+        response = post_json_request(generate_url, payload, timeout=120)
+    except urllib_error.HTTPError as exc:
+        raise HTTPException(exc.code, f"Ollama returned HTTP {exc.code}") from exc
+    except urllib_error.URLError as exc:
+        raise HTTPException(400, f"Could not reach Ollama at {base_url}: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise HTTPException(408, f"Ollama timed out while running {model_name}") from exc
+    except Exception as exc:
+        raise HTTPException(400, f"LLM execution failed: {exc}") from exc
+
+    return {
+        "provider": provider,
+        "model": model_name,
+        "response": response.get("response", ""),
+        "done": response.get("done", True),
+        "totalDuration": response.get("total_duration"),
+        "evalCount": response.get("eval_count"),
+        "evalDuration": response.get("eval_duration"),
+        "promptEvalCount": response.get("prompt_eval_count"),
+    }
 
 
 @app.get("/api/projects")
@@ -1489,11 +2308,13 @@ async def enroll_prompt_dataset(
     class_dir.mkdir(parents=True, exist_ok=True)
 
     saved_files = 0
+    unsupported_files: list[str] = []
     for upload in files:
         if not upload.filename:
             continue
         suffix = Path(upload.filename).suffix.lower()
-        if suffix not in IMAGE_EXTENSIONS:
+        if suffix not in PROMPT_ENROLLMENT_IMAGE_EXTENSIONS:
+            unsupported_files.append(upload.filename)
             continue
         target_name = f"{uuid.uuid4().hex}{suffix}"
         target_path = class_dir / target_name
@@ -1501,6 +2322,12 @@ async def enroll_prompt_dataset(
         saved_files += 1
 
     if saved_files == 0:
+        if unsupported_files:
+            raise HTTPException(
+                400,
+                "Prompt enrollment currently supports JPG, JPEG, PNG, BMP, GIF, and WEBP files only. "
+                f"Unsupported file(s): {', '.join(unsupported_files)}",
+            )
         raise HTTPException(400, "Only image files are supported for prompt enrollment")
 
     metadata = summarize_prompt_image_dataset(project_root)
@@ -1546,7 +2373,7 @@ def get_training_logs(project_id: str):
 async def start_training(project_id: str, req: Request):
     project_exists(project_id)
     conn = get_conn()
-    dataset = conn.execute("SELECT id, task_type FROM datasets WHERE project_id = ? ORDER BY created_at DESC LIMIT 1", (project_id,)).fetchone()
+    dataset = conn.execute("SELECT id, task_type, label_count FROM datasets WHERE project_id = ? ORDER BY created_at DESC LIMIT 1", (project_id,)).fetchone()
     if dataset is None:
         conn.close()
         raise HTTPException(400, "Upload a dataset before starting training")
@@ -1561,6 +2388,9 @@ async def start_training(project_id: str, req: Request):
         training_epochs = max(1, min(int(body.get("trainingEpochs", 6) or 6), 50))
     except (TypeError, ValueError):
         training_epochs = 6
+    if dataset["task_type"] == "image-classification" and int(dataset["label_count"] or 0) < 2:
+        conn.close()
+        raise HTTPException(400, "Image training requires at least 2 classes/labels. Add another labeled image group before starting training.")
     if prefer_gpu and dataset["task_type"] != "image-classification":
         conn.close()
         raise HTTPException(400, "Always Use GPU is currently supported only for image-classification training.")
@@ -1686,7 +2516,7 @@ async def predict(model_id: str, request: Request, authorization: str | None = H
     if task_type == "image-classification":
         try:
             import torch
-            from PIL import Image
+            from PIL import Image, UnidentifiedImageError
             from torchvision import transforms
         except Exception as exc:
             raise HTTPException(500, f"Image inference is unavailable: {exc}") from exc
@@ -1695,6 +2525,13 @@ async def predict(model_id: str, request: Request, authorization: str | None = H
         image_file = form.get("file")
         if image_file is None:
             raise HTTPException(400, "Send an image file as multipart/form-data with the field name 'file'")
+        image_name = str(getattr(image_file, "filename", "") or "")
+        image_suffix = Path(image_name).suffix.lower()
+        if image_suffix and image_suffix not in IMAGE_EXTENSIONS:
+            raise HTTPException(
+                400,
+                f"Prediction currently supports JPG, JPEG, PNG, BMP, GIF, and WEBP only. Unsupported file: {image_name}",
+            )
         model_path = MODELS_DIR / f"{model_id}.pt"
         if not model_path.exists():
             raise HTTPException(404, "Model file not found")
@@ -1706,7 +2543,13 @@ async def predict(model_id: str, request: Request, authorization: str | None = H
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ]
         )
-        image = Image.open(image_file.file).convert("RGB")
+        try:
+            image = Image.open(image_file.file).convert("RGB")
+        except UnidentifiedImageError as exc:
+            raise HTTPException(
+                400,
+                "The uploaded file could not be read as an image. Use JPG, JPEG, PNG, BMP, GIF, or WEBP for prediction.",
+            ) from exc
         tensor = transform(image).unsqueeze(0)
         with torch.no_grad():
             logits = model(tensor)

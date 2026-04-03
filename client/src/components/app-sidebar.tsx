@@ -6,6 +6,7 @@ import {
   HelpCircle,
   Cpu,
   Zap,
+  BrainCircuit,
 } from "lucide-react";
 import {
   Sidebar,
@@ -31,6 +32,11 @@ const mainNavItems = [
     url: "/projects",
     icon: FolderKanban,
   },
+  {
+    title: "LLM Studio",
+    url: "/llm-studio",
+    icon: BrainCircuit,
+  },
 ];
 
 const supportNavItems = [
@@ -48,6 +54,7 @@ const supportNavItems = [
 
 export function AppSidebar() {
   const [location] = useLocation();
+  const getNavTestId = (title: string) => `nav-${title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
 
   return (
     <Sidebar>
@@ -75,7 +82,7 @@ export function AppSidebar() {
                   <SidebarMenuButton
                     asChild
                     isActive={location === item.url || (item.url === "/projects" && location.startsWith("/project"))}
-                    data-testid={`nav-${item.title.toLowerCase()}`}
+                    data-testid={getNavTestId(item.title)}
                   >
                     <Link href={item.url}>
                       <item.icon className="w-4 h-4" />
@@ -99,7 +106,7 @@ export function AppSidebar() {
                   <SidebarMenuButton
                     asChild
                     isActive={location === item.url}
-                    data-testid={`nav-${item.title.toLowerCase()}`}
+                    data-testid={getNavTestId(item.title)}
                   >
                     <Link href={item.url}>
                       <item.icon className="w-4 h-4" />

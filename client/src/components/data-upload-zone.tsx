@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
+import type { Dataset } from "@shared/schema";
 
 interface UploadedFile {
     id: string;
@@ -20,7 +21,7 @@ interface UploadedFile {
 
 interface DataUploadZoneProps {
     projectId: string;
-    onUploadComplete?: () => void;
+    onUploadComplete?: (dataset?: Dataset) => void;
 }
 
 export function DataUploadZone({ projectId, onUploadComplete }: DataUploadZoneProps) {
@@ -33,6 +34,7 @@ export function DataUploadZone({ projectId, onUploadComplete }: DataUploadZonePr
     const [enrollmentPrompt, setEnrollmentPrompt] = useState("");
     const [enrollmentFiles, setEnrollmentFiles] = useState<File[]>([]);
     const [isEnrollingImages, setIsEnrollingImages] = useState(false);
+    const supportedEnrollmentExtensions = [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"];
 
     const handleDragOver = useCallback((e: React.DragEvent) => {
         e.preventDefault();
@@ -100,9 +102,10 @@ export function DataUploadZone({ projectId, onUploadComplete }: DataUploadZonePr
                 throw new Error("Upload failed");
             }
 
+            const result = await response.json();
             setFiles(prev => prev.map(f => f.id === fileId ? { ...f, progress: 100, status: "completed" } : f));
             toast({ title: "Upload Successful", description: "Dataset has been securely saved." });
-            onUploadComplete?.();
+            onUploadComplete?.(result);
         } catch (error) {
             setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: "error", error: "Upload failed" } : f));
             toast({ title: "Upload Failed", description: "There was an error saving your dataset.", variant: "destructive" });
@@ -133,9 +136,10 @@ export function DataUploadZone({ projectId, onUploadComplete }: DataUploadZonePr
                 throw new Error(message || "Kaggle import failed");
             }
 
+            const result = await response.json();
             setKaggleUrl("");
             toast({ title: "Kaggle Import Complete", description: "The image dataset is ready for training." });
-            onUploadComplete?.();
+            onUploadComplete?.(result);
         } catch (error) {
             toast({
                 title: "Kaggle Import Failed",
@@ -167,6 +171,20 @@ export function DataUploadZone({ projectId, onUploadComplete }: DataUploadZonePr
             return;
         }
 
+        const invalidEnrollmentFiles = enrollmentFiles.filter((file) => {
+            const lowerName = file.name.toLowerCase();
+            return !supportedEnrollmentExtensions.some((extension) => lowerName.endsWith(extension));
+        });
+
+        if (invalidEnrollmentFiles.length > 0) {
+            toast({
+                title: "Unsupported image format",
+                description: `Prompt enrollment supports JPG, JPEG, PNG, BMP, GIF, and WEBP only. Please convert ${invalidEnrollmentFiles[0].name} before uploading.`,
+                variant: "destructive",
+            });
+            return;
+        }
+
         setIsEnrollingImages(true);
         try {
             const formData = new FormData();
@@ -190,7 +208,7 @@ export function DataUploadZone({ projectId, onUploadComplete }: DataUploadZonePr
                 title: "Images enrolled",
                 description: result.message || `Saved images under ${result.enrolledLabel}.`,
             });
-            onUploadComplete?.();
+            onUploadComplete?.(result);
         } catch (error) {
             toast({
                 title: "Enrollment Failed",
@@ -298,10 +316,31 @@ export function DataUploadZone({ projectId, onUploadComplete }: DataUploadZonePr
                         />
                         <Input
                             type="file"
-                            accept="image/*"
+                            accept=".jpg,.jpeg,.png,.bmp,.gif,.webp,image/jpeg,image/png,image/bmp,image/gif,image/webp"
                             multiple
                             disabled={isUploading || isEnrollingImages}
-                            onChange={(e) => setEnrollmentFiles(Array.from(e.target.files || []))}
+                            onChange={(e) => {
+                                const nextFiles = Array.from(e.target.files || []);
+                                const invalidFiles = nextFiles.filter((file) => {
+                                    const lowerName = file.name.toLowerCase();
+                                    return !supportedEnrollmentExtensions.some((extension) => lowerName.endsWith(extension));
+                                });
+
+                                if (invalidFiles.length > 0) {
+                                    toast({
+                                        title: "Unsupported image format",
+                                        description: `Prompt enrollment supports JPG, JPEG, PNG, BMP, GIF, and WEBP only. ${invalidFiles[0].name} cannot be used directly.`,
+                                        variant: "destructive",
+                                    });
+                                }
+
+                                setEnrollmentFiles(
+                                    nextFiles.filter((file) => {
+                                        const lowerName = file.name.toLowerCase();
+                                        return supportedEnrollmentExtensions.some((extension) => lowerName.endsWith(extension));
+                                    })
+                                );
+                            }}
                             data-testid="input-enrollment-images"
                         />
                         {enrollmentFiles.length > 0 && (

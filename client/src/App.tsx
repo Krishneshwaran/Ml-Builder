@@ -14,6 +14,7 @@ import ProjectDetail from "@/pages/project-detail";
 import RunModel from "@/pages/run-model";
 import Settings from "@/pages/settings";
 import Help from "@/pages/help";
+import LlmStudio from "@/pages/llm-studio";
 import NotFound from "@/pages/not-found";
 
 function Router() {
@@ -24,6 +25,7 @@ function Router() {
       <Route path="/projects/new" component={NewProject} />
       <Route path="/project/:id" component={ProjectDetail} />
       <Route path="/project/:id/run" component={RunModel} />
+      <Route path="/llm-studio" component={LlmStudio} />
       <Route path="/settings" component={Settings} />
       <Route path="/help" component={Help} />
       <Route component={NotFound} />

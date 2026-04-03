@@ -42,7 +42,7 @@ export const defaultSettings: AppSettings = {
   useImageAugmentation: true,
   llmProvider: "ollama",
   llmBaseUrl: "http://localhost:11434",
-  llmModel: "deepseek-r1:1.5b",
+  llmModel: "deepseek-r1:8b",
   llmApiKey: "",
 };
 
@@ -50,7 +50,11 @@ export function loadSettings(): AppSettings {
   try {
     const saved = localStorage.getItem(SETTINGS_KEY);
     if (saved) {
-      return { ...defaultSettings, ...JSON.parse(saved) };
+      const merged = { ...defaultSettings, ...JSON.parse(saved) };
+      if (merged.llmModel === "deepseek-r1:1.5b") {
+        merged.llmModel = defaultSettings.llmModel;
+      }
+      return merged;
     }
   } catch {}
   return defaultSettings;

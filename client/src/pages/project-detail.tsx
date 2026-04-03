@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useParams, useLocation } from "wouter";
-import { ArrowLeft, ArrowRight, Play, Loader2, CheckCircle } from "lucide-react";
+import { ArrowLeft, ArrowRight, Play, Loader2, CheckCircle, BrainCircuit, ShieldCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -25,6 +25,8 @@ export default function ProjectDetail() {
   const [currentStep, setCurrentStep] = useState(1);
   const [isDatasetUploaded, setIsDatasetUploaded] = useState(false);
   const [deploymentType, setDeploymentType] = useState<"cloud-api" | "edge-device">("cloud-api");
+  const [isTrainingBooting, setIsTrainingBooting] = useState(false);
+  const [optimisticTrainingModel, setOptimisticTrainingModel] = useState<MlModel | null>(null);
 
   const {
     data: project,
@@ -58,6 +60,7 @@ export default function ProjectDetail() {
       return false;
     },
   });
+  const effectiveModel = model || optimisticTrainingModel;
 
   const { data: deployment } = useQuery<Deployment>({
     queryKey: ["/api/projects", id, "deployment"],
@@ -91,7 +94,7 @@ export default function ProjectDetail() {
 
   // Auto-advance to deployment step when training completes
   useEffect(() => {
-    if (model?.status === "completed" && currentStep === 4) {
+    if (effectiveModel?.status === "completed" && currentStep === 4) {
       // Wait a moment for the user to see the completion state, then suggest moving forward
       const timer = setTimeout(() => {
         toast({
@@ -101,7 +104,23 @@ export default function ProjectDetail() {
       }, 1500);
       return () => clearTimeout(timer);
     }
-  }, [model?.status, currentStep, toast]);
+  }, [effectiveModel?.status, currentStep, toast]);
+
+  useEffect(() => {
+    if (currentStep === 4 && project?.status === "training" && !effectiveModel) {
+      setIsTrainingBooting(true);
+      return;
+    }
+    if (effectiveModel?.status === "training" || effectiveModel?.status === "completed" || effectiveModel?.status === "failed") {
+      setIsTrainingBooting(false);
+    }
+  }, [currentStep, project?.status, effectiveModel]);
+
+  useEffect(() => {
+    if (model) {
+      setOptimisticTrainingModel(null);
+    }
+  }, [model]);
 
   const template = systemTemplates.find((t) => t.id === project?.templateId);
 
@@ -162,6 +181,37 @@ export default function ProjectDetail() {
       .reverse()
       .find((entry) => entry.message.toLowerCase().includes("training device:"))
       ?.message.replace(/^.*training device:\s*/i, "") || null;
+  const isImageCapableTemplate = template?.dataTypes.includes("images") || false;
+  const shouldShowRecognitionEntry =
+    isImageCapableTemplate ||
+    isImageDataset ||
+    model?.taskType === "image-classification";
+  const isRecognitionReady = model?.taskType === "image-classification" && deployment?.status === "active";
+  const recognitionChecklist = [
+    {
+      label: "Enroll labeled images",
+      done: !!dataset && datasetTaskType === "image-classification",
+    },
+    {
+      label: "Train image model",
+      done: model?.taskType === "image-classification" && model?.status === "completed",
+    },
+    {
+      label: "Deploy recognition endpoint",
+      done: model?.taskType === "image-classification" && deployment?.status === "active",
+    },
+  ];
+  const nextRecognitionMessage = !shouldShowRecognitionEntry
+    ? null
+    : !dataset
+      ? "Upload labeled images first so the system learns who each person is."
+      : datasetTaskType !== "image-classification"
+        ? "This project needs an image dataset with person labels before recognition can work."
+        : !model || model.taskType !== "image-classification" || model.status !== "completed"
+          ? "Train the image model first so the app can recognize later photos."
+          : deployment?.status !== "active"
+            ? "Deploy the trained model to enable live person recognition."
+            : "Recognition is ready. Upload a fresh image and the app will predict the enrolled person.";
 
   const updateProject = useMutation({
     mutationFn: async (data: Partial<Project>) => {
@@ -185,12 +235,16 @@ export default function ProjectDetail() {
         trainingEpochs: settings.imageTrainingEpochs,
         useImageAugmentation: settings.useImageAugmentation,
       });
-      return res.json();
+      return res.json() as Promise<MlModel>;
     },
-    onSuccess: () => {
+    onSuccess: (createdModel) => {
       queryClient.invalidateQueries({ queryKey: ["/api/projects", id, "model"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/projects", id, "training-logs"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/projects", id] });
+      setOptimisticTrainingModel(createdModel);
       updateProject.mutate({ currentStep: 4, status: "training" });
       setCurrentStep(4);
+      setIsTrainingBooting(true);
       toast({
         title: "Training started",
         description: "Your model is now training. This may take a few minutes.",
@@ -285,9 +339,27 @@ export default function ProjectDetail() {
           <div className="space-y-6">
             <DataUploadZone
               projectId={project.id}
-              onUploadComplete={() => {
+              onUploadComplete={(uploadedDataset) => {
                 setIsDatasetUploaded(true);
                 queryClient.invalidateQueries({ queryKey: ["/api/projects", id, "dataset"] });
+                const labelCount = Number(uploadedDataset?.labelCount || 0);
+                const isImageClassification = uploadedDataset?.taskType === "image-classification";
+                if (isImageClassification && labelCount < 2) {
+                  updateProject.mutate({ currentStep: 2, status: project.status === "draft" ? "configuring" : project.status });
+                  setCurrentStep(2);
+                  toast({
+                    title: "Add another label first",
+                    description: "Image training needs at least 2 classes/labels. Stay on Data and enroll one more person or category before moving on.",
+                    variant: "destructive",
+                  });
+                  return;
+                }
+                updateProject.mutate({ currentStep: 3, status: project.status === "draft" ? "configuring" : project.status });
+                setCurrentStep(3);
+                toast({
+                  title: "Dataset ready",
+                  description: "Your data was uploaded successfully. Moving to pipeline setup now.",
+                });
               }}
             />
           </div>
@@ -314,14 +386,18 @@ export default function ProjectDetail() {
       case 4:
         return (
           <div className="space-y-6">
-            {model?.status === "training" ? (
+            {effectiveModel?.status === "training" || isTrainingBooting ? (
               <>
                 <Card>
                   <CardContent className="py-12 text-center">
                     <Loader2 className="w-12 h-12 mx-auto mb-4 text-primary animate-spin" />
-                    <h3 className="text-lg font-medium text-foreground mb-2">Training in Progress</h3>
+                    <h3 className="text-lg font-medium text-foreground mb-2">
+                      {isTrainingBooting && effectiveModel?.status !== "training" ? "Starting Training" : "Training in Progress"}
+                    </h3>
                     <p className="text-sm text-muted-foreground mb-4">
-                      Your model is being trained. This typically takes 5-15 minutes.
+                      {isTrainingBooting && effectiveModel?.status !== "training"
+                        ? "The backend is preparing the training job and attaching the live console."
+                        : "Your model is being trained. This typically takes 5-15 minutes."}
                     </p>
                     <p className="text-sm text-foreground mb-4">
                       Training on: {liveTrainingDevice || "Detecting device..."}
@@ -329,20 +405,20 @@ export default function ProjectDetail() {
                     <div className="max-w-xs mx-auto">
                       <div className="flex justify-between text-xs text-muted-foreground mb-1">
                         <span>Progress</span>
-                        <span>{model.trainingProgress || 0}%</span>
+                        <span>{effectiveModel?.trainingProgress || (isTrainingBooting ? 5 : 0)}%</span>
                       </div>
                       <div className="h-2 bg-muted rounded-full overflow-hidden">
                         <div
                           className="h-full bg-primary transition-all duration-500"
-                          style={{ width: `${model.trainingProgress || 0}%` }}
+                          style={{ width: `${effectiveModel?.trainingProgress || (isTrainingBooting ? 5 : 0)}%` }}
                         />
                       </div>
                     </div>
                   </CardContent>
                 </Card>
-                <LiveTrainingLogs progress={model.trainingProgress || 0} logs={trainingLogs} />
+                <LiveTrainingLogs progress={effectiveModel?.trainingProgress || (isTrainingBooting ? 5 : 0)} logs={trainingLogs} />
               </>
-            ) : model?.status === "completed" ? (
+            ) : effectiveModel?.status === "completed" ? (
               <>
                 <Card>
                   <CardContent className="py-6">
@@ -364,6 +440,25 @@ export default function ProjectDetail() {
                   </CardContent>
                 </Card>
                 <TrainingMetrics model={model} />
+                {effectiveModel?.taskType === "image-classification" && (
+                  <Card className="border-primary/20 bg-primary/5">
+                    <CardContent className="py-5 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                      <div>
+                        <p className="font-medium text-foreground">Later identity check</p>
+                        <p className="text-sm text-muted-foreground">
+                          After deployment, upload a fresh image and the app can tell you whether it looks like an enrolled label such as Dharshaneshwaran.
+                        </p>
+                      </div>
+                      <Button
+                        variant="outline"
+                        onClick={() => setCurrentStep(5)}
+                        data-testid="button-go-to-deploy-for-identity-check"
+                      >
+                        Continue to Deploy
+                      </Button>
+                    </CardContent>
+                  </Card>
+                )}
               </>
             ) : (
               <Card>
@@ -464,9 +559,113 @@ export default function ProjectDetail() {
           <h1 className="text-xl font-bold text-foreground">{project.name}</h1>
           <p className="text-sm text-muted-foreground">{project.description || template?.name}</p>
         </div>
+        {shouldShowRecognitionEntry && (
+          <Button
+            onClick={() => {
+              if (isRecognitionReady) {
+                setLocation(`/project/${project.id}/run`);
+                return;
+              }
+              if (!dataset || datasetTaskType !== "image-classification") {
+                setCurrentStep(2);
+                return;
+              }
+              if (!model || model.status !== "completed") {
+                setCurrentStep(4);
+                return;
+              }
+              setCurrentStep(5);
+            }}
+            variant={isRecognitionReady ? "default" : "outline"}
+            disabled={!isRecognitionReady && !shouldShowRecognitionEntry}
+            data-testid="button-recognize-person"
+          >
+            <ShieldCheck className="w-4 h-4 mr-2" />
+            {isRecognitionReady ? "Recognize Person" : "Prepare Recognition"}
+          </Button>
+        )}
       </div>
 
       <WorkflowSteps currentStep={currentStep} />
+
+      <Card className="border-primary/20 bg-primary/5">
+        <CardContent className="py-4 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+          <div className="flex items-start gap-3">
+            <div className="flex items-center justify-center w-10 h-10 rounded-xl bg-primary/15">
+              <BrainCircuit className="w-5 h-5 text-primary" />
+            </div>
+            <div>
+              <p className="font-medium text-foreground">Project AI Assistant</p>
+              <p className="text-sm text-muted-foreground">
+                Open this project inside LLM Studio to design dataset classes, analyze bad predictions, and review deployment safety with your local Ollama model.
+              </p>
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            onClick={() => setLocation(`/llm-studio?projectId=${project.id}`)}
+            data-testid="button-open-project-llm-studio"
+          >
+            Open LLM Studio
+          </Button>
+        </CardContent>
+      </Card>
+
+      {shouldShowRecognitionEntry && nextRecognitionMessage && (
+        <Card className="border-primary/20 bg-primary/5">
+          <CardContent className="py-5 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-primary" />
+                <p className="font-medium text-foreground">Person Recognition Readiness</p>
+              </div>
+              <p className="text-sm text-muted-foreground">{nextRecognitionMessage}</p>
+              <div className="flex flex-wrap gap-2">
+                {recognitionChecklist.map((item) => (
+                  <div
+                    key={item.label}
+                    className={`rounded-full px-3 py-1 text-xs font-medium ${
+                      item.done
+                        ? "bg-chart-2/15 text-chart-2"
+                        : "bg-muted text-muted-foreground"
+                    }`}
+                  >
+                    {item.done ? "Done" : "Pending"}: {item.label}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <Button
+              variant={isRecognitionReady ? "default" : "outline"}
+              onClick={() => {
+                if (isRecognitionReady) {
+                  setLocation(`/project/${project.id}/run`);
+                  return;
+                }
+                if (!dataset || datasetTaskType !== "image-classification") {
+                  setCurrentStep(2);
+                  return;
+                }
+                if (!model || model.status !== "completed") {
+                  setCurrentStep(4);
+                  return;
+                }
+                setCurrentStep(5);
+              }}
+              data-testid="button-recognition-readiness-action"
+            >
+              <ShieldCheck className="w-4 h-4 mr-2" />
+              {isRecognitionReady
+                ? "Open Recognition"
+                : !dataset || datasetTaskType !== "image-classification"
+                  ? "Go to Data Upload"
+                  : !model || model.status !== "completed"
+                    ? "Go to Training"
+                    : "Go to Deploy"}
+            </Button>
+          </CardContent>
+        </Card>
+      )}
 
       <div className="min-h-[400px]">
         {renderStepContent()}

@@ -1,6 +1,6 @@
 import { useLocation, useParams } from "wouter";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, ShieldCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -52,6 +52,8 @@ export default function RunModel() {
     );
   }
 
+  const isIdentityStyleModel = model.taskType === "image-classification";
+
   return (
     <div className="p-6 max-w-5xl mx-auto space-y-6" data-testid="run-model-page">
       <Button variant="ghost" onClick={() => setLocation(`/project/${project.id}`)} className="gap-2">
@@ -60,11 +62,32 @@ export default function RunModel() {
       </Button>
 
       <div>
-        <h1 className="text-2xl font-bold text-foreground">Run Model</h1>
+        <h1 className="text-2xl font-bold text-foreground">
+          {isIdentityStyleModel ? "Identity Recognition" : "Run Model"}
+        </h1>
         <p className="text-muted-foreground">
-          Test {project.name} with a fresh {model.taskType === "image-classification" ? "image" : "input sample"}.
+          {isIdentityStyleModel
+            ? `Upload a later image and check whether ${project.name} recognizes the enrolled person or class.`
+            : `Test ${project.name} with a fresh ${model.taskType === "image-classification" ? "image" : "input sample"}.`}
         </p>
       </div>
+
+      {isIdentityStyleModel && (
+        <Card className="border-primary/20 bg-primary/5">
+          <CardContent className="py-4 flex items-start gap-3">
+            <div className="flex items-center justify-center w-10 h-10 rounded-xl bg-primary/15 shrink-0">
+              <ShieldCheck className="w-5 h-5 text-primary" />
+            </div>
+            <div>
+              <p className="font-medium text-foreground">How this works</p>
+              <p className="text-sm text-muted-foreground">
+                First you enroll images under labels like <span className="font-medium">Dharshaneshwaran</span>, then train the model.
+                Later, you upload a fresh image here and the model predicts which enrolled label it matches best.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       <Card>
         <CardHeader className="pb-3">

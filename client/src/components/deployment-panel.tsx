@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useLocation } from "wouter";
-import { Cloud, Cpu, Check, Copy, ExternalLink, Activity, Clock, Zap } from "lucide-react";
+import { Cloud, Cpu, Check, Copy, ExternalLink, Activity, Clock, Zap, ShieldCheck } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -30,6 +30,7 @@ export function DeploymentPanel({
   const [, setLocation] = useLocation();
   const [selectedType, setSelectedType] = useState<"cloud-api" | "edge-device">("cloud-api");
   const [copied, setCopied] = useState<string | null>(null);
+  const isIdentityRecognitionModel = model?.taskType === "image-classification";
 
   const handleTypeChange = (type: "cloud-api" | "edge-device") => {
     setSelectedType(type);
@@ -224,7 +225,14 @@ export function DeploymentPanel({
               onClick={() => setLocation(`/project/${deployment.projectId}/run`)}
               data-testid="button-open-run-page"
             >
-              Open Run Page
+              {isIdentityRecognitionModel ? (
+                <>
+                  <ShieldCheck className="w-4 h-4 mr-2" />
+                  Recognize Person
+                </>
+              ) : (
+                "Open Run Page"
+              )}
             </Button>
           )}
 
