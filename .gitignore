@@ -1,0 +1,97 @@
+# Dependencies
+node_modules/
+client/node_modules/
+backend/venv/
+.venv/
+venv/
+.local/
+*/node_modules/
+
+# Build and outputs
+dist/
+dist-*/
+build/
+.next/
+client/.next/
+out/
+coverage/
+htmlcov/
+server/public/
+.serverless/
+*.tar.gz
+*.zip
+
+# Environment and secrets
+.env
+.env.*
+*.env
+!.env.example
+!.env.*.example
+client/.env
+backend/.env
+server/.env
+kaggle.json
+
+# Databases and local runtime data
+*.db
+*.sqlite
+*.sqlite3
+backend/mlforge*.db
+test_simple.db
+storage/
+backend/storage/
+
+# ML artifacts
+*.pkl
+*.joblib
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.safetensors
+
+# Python
+__pycache__/
+backend/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.python-version
+.ipynb_checkpoints/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# Editor and IDE files
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+.history/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local assets and scratch files
+attached_assets/
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Misc
+vite.config.ts.*
+README.generated.md
+test_dataset.csv
+
