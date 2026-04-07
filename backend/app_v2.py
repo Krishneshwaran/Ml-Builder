@@ -17,7 +17,7 @@ from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -78,6 +78,7 @@ class LlmProjectBuildRequest(BaseModel):
     usePretrainedWeights: bool = False
     trainingEpochs: int = 12
     useImageAugmentation: bool = True
+    preferSmallDataset: bool = False
 
 
 def get_conn():
@@ -514,6 +515,45 @@ def resolve_image_dataset(base_dir: Path) -> dict[str, Any]:
     }
 
 
+def evaluate_image_dataset_readiness(
+    *,
+    image_count: int,
+    label_count: int,
+    template_id: str | None = None,
+) -> str | None:
+    if label_count < 2:
+        return "Image training requires at least 2 labels."
+
+    average_images_per_label = image_count / max(label_count, 1)
+    is_access_control = template_id == "access-control"
+
+    if is_access_control and label_count > 100:
+        return (
+            f"This person-recognition dataset has {label_count} identities, which is too many for this local workflow. "
+            "Enroll a small set of named people instead of using a celebrity dataset with thousands of classes."
+        )
+
+    if label_count >= 1000:
+        return (
+            f"This dataset has {label_count} labels for only {image_count} images. "
+            "That class count is too high for a practical local training run."
+        )
+
+    if average_images_per_label < 3:
+        return (
+            f"This dataset averages only {average_images_per_label:.1f} images per label. "
+            "Add more examples per class or choose a dataset with fewer labels."
+        )
+
+    if is_access_control and average_images_per_label < 8:
+        return (
+            f"This person-recognition dataset averages only {average_images_per_label:.1f} images per identity. "
+            "Enroll more photos per person before training."
+        )
+
+    return None
+
+
 def summarize_prompt_image_dataset(base_dir: Path) -> dict[str, Any]:
     train_dir = base_dir / "train"
     if not train_dir.exists():
@@ -624,6 +664,37 @@ def safe_delete_project_resources(project_id: str) -> bool:
     except sqlite3.Error:
         logger.exception("Project cleanup failed for %s", project_id)
         return False
+
+
+def clear_cached_training_artifacts() -> dict[str, Any]:
+    conn = get_conn()
+    try:
+        project_ids = [row["id"] for row in conn.execute("SELECT id FROM projects").fetchall()]
+    finally:
+        conn.close()
+
+    deleted_projects = 0
+    for project_id in project_ids:
+        if safe_delete_project_resources(project_id):
+            deleted_projects += 1
+
+    # Remove any leftover generated artifacts without touching application code.
+    for directory in (MODELS_DIR, KAGGLE_DIR, UPLOADS_DIR, PROMPT_DATASETS_DIR):
+        if not directory.exists():
+            continue
+        for child in directory.iterdir():
+            remove_path_if_exists(str(child))
+
+    return {
+        "deletedProjects": deleted_projects,
+        "clearedDirectories": [
+            str(MODELS_DIR),
+            str(KAGGLE_DIR),
+            str(UPLOADS_DIR),
+            str(PROMPT_DATASETS_DIR),
+        ],
+        "message": "Cleared generated model and dataset cache files. Source code was not changed.",
+    }
 
 
 def upsert_prompt_dataset_record(project_id: str, local_path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -893,6 +964,7 @@ def infer_project_plan_from_prompt(prompt: str) -> dict[str, Any]:
             "templateId": "access-control",
             "taskType": "image-classification",
             "desiredLabels": [],
+            "preferSmallDataset": True,
             "searchQueries": [
                 cleaned_prompt,
                 "face recognition people image classification dataset",
@@ -986,6 +1058,7 @@ def normalize_project_plan(candidate_plan: dict[str, Any] | None, fallback_plan:
         "templateId": template_id,
         "taskType": "image-classification",
         "desiredLabels": desired_labels,
+        "preferSmallDataset": bool(candidate.get("preferSmallDataset", fallback_plan.get("preferSmallDataset", False))),
         "searchQueries": search_queries[:3],
         "strictLabelMatch": bool(candidate.get("strictLabelMatch", fallback_plan.get("strictLabelMatch", False))),
         "planningMode": str(candidate.get("planningMode") or fallback_plan.get("planningMode") or "heuristic"),
@@ -1003,12 +1076,18 @@ def summarize_kaggle_candidate(item: Any) -> dict[str, Any]:
     }
 
 
-def search_kaggle_datasets(search_query: str, limit: int = 3) -> list[dict[str, Any]]:
+def search_kaggle_datasets(
+    search_query: str,
+    limit: int = 3,
+    log_callback: Callable[[str], None] | None = None,
+) -> list[dict[str, Any]]:
     from kaggle.api.kaggle_api_extended import KaggleApi
 
     try:
         api = KaggleApi()
         api.authenticate()
+        if log_callback:
+            log_callback(f"Kaggle search: {search_query}")
         results = api.dataset_list(search=search_query, sort_by="votes", page=1)
     except Exception as exc:
         raise HTTPException(
@@ -1021,10 +1100,16 @@ def search_kaggle_datasets(search_query: str, limit: int = 3) -> list[dict[str, 
         summary = summarize_kaggle_candidate(item)
         if summary["ref"]:
             summaries.append(summary)
+    if log_callback:
+        log_callback(f"Kaggle search returned {len(summaries)} candidate dataset(s)")
     return summaries
 
 
-def download_kaggle_dataset_ref(dataset_ref: str, dataset_id: str) -> tuple[Path, dict[str, Any]]:
+def download_kaggle_dataset_ref(
+    dataset_ref: str,
+    dataset_id: str,
+    log_callback: Callable[[str], None] | None = None,
+) -> tuple[Path, dict[str, Any]]:
     from kaggle.api.kaggle_api_extended import KaggleApi
 
     target_dir = KAGGLE_DIR / dataset_id
@@ -1034,13 +1119,22 @@ def download_kaggle_dataset_ref(dataset_ref: str, dataset_id: str) -> tuple[Path
     try:
         api = KaggleApi()
         api.authenticate()
+        if log_callback:
+            log_callback(f"Downloading Kaggle dataset: {dataset_ref}")
         api.dataset_download_files(dataset_ref, path=str(target_dir), unzip=True, quiet=False)
     except Exception as exc:
         raise HTTPException(
             400,
             f"Kaggle download failed. Set KAGGLE_USERNAME and KAGGLE_KEY in backend/.env or ~/.kaggle/kaggle.json. Details: {exc}",
         ) from exc
-    return target_dir, resolve_image_dataset(target_dir)
+    if log_callback:
+        log_callback(f"Download complete. Inspecting extracted files in {target_dir.name}")
+    metadata = resolve_image_dataset(target_dir)
+    if log_callback:
+        log_callback(
+            f"Imported {metadata.get('file_count', 0)} image(s) across {metadata.get('label_count', 0)} class(es)"
+        )
+    return target_dir, metadata
 
 
 def count_label_matches(actual_labels: list[str], desired_labels: list[str]) -> tuple[int, list[str]]:
@@ -1090,6 +1184,20 @@ def rank_kaggle_candidate(candidate: dict[str, Any], plan: dict[str, Any]) -> in
         score += min(int(candidate.get("downloadCount") or 0) // 250, 80)
     except (TypeError, ValueError):
         pass
+    try:
+        total_bytes = int(candidate.get("size") or 0)
+    except (TypeError, ValueError):
+        total_bytes = 0
+
+    if plan.get("preferSmallDataset"):
+        if 0 < total_bytes <= 150 * 1024 * 1024:
+            score += 140
+        elif total_bytes <= 500 * 1024 * 1024:
+            score += 90
+        elif total_bytes <= 1024 * 1024 * 1024:
+            score += 35
+        elif total_bytes > 2 * 1024 * 1024 * 1024:
+            score -= 120
 
     for desired_label in plan.get("desiredLabels", []):
         normalized_label = normalize_lookup_text(desired_label)
@@ -1113,14 +1221,17 @@ def rank_kaggle_candidate(candidate: dict[str, Any], plan: dict[str, Any]) -> in
     return score
 
 
-def select_kaggle_dataset_for_plan(plan: dict[str, Any]) -> dict[str, Any]:
+def select_kaggle_dataset_for_plan(
+    plan: dict[str, Any],
+    log_callback: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     search_queries = [query for query in plan.get("searchQueries", []) if str(query or "").strip()]
     if not search_queries:
         raise HTTPException(400, "No dataset search queries were generated for this request")
 
     candidates_by_ref: dict[str, dict[str, Any]] = {}
     for search_query in search_queries:
-        for candidate in search_kaggle_datasets(search_query):
+        for candidate in search_kaggle_datasets(search_query, log_callback=log_callback):
             dataset_ref = candidate["ref"]
             existing = candidates_by_ref.get(dataset_ref)
             candidate_payload = {
@@ -1148,16 +1259,37 @@ def select_kaggle_dataset_for_plan(plan: dict[str, Any]) -> dict[str, Any]:
                 blocked_term in candidate_lookup
                 for blocked_term in ("object detection", "detection", "yolo", "segmentation", "bounding box", "annotations")
             ):
+                if log_callback:
+                    log_callback(f"Skipped {candidate['ref']} because it looks like a detection dataset")
                 attempts.append(f"{candidate['ref']}: skipped because it looks like a detection dataset, not image classification.")
                 continue
-            target_dir, metadata = download_kaggle_dataset_ref(candidate["ref"], dataset_id)
+            if log_callback:
+                log_callback(
+                    f"Trying Kaggle candidate: {candidate['ref']} (votes={candidate.get('voteCount') or 0}, downloads={candidate.get('downloadCount') or 0})"
+                )
+            target_dir, metadata = download_kaggle_dataset_ref(candidate["ref"], dataset_id, log_callback=log_callback)
             desired_labels = plan.get("desiredLabels", [])
             exact_match_count, matched_labels = count_label_matches(metadata.get("labels", []), desired_labels)
             if plan.get("strictLabelMatch") and desired_labels and exact_match_count < len(desired_labels):
                 remove_path_if_exists(str(target_dir))
+                if log_callback:
+                    log_callback(
+                        f"Rejected {candidate['ref']} because labels {metadata.get('labels', [])} did not match {desired_labels}"
+                    )
                 attempts.append(
                     f"{candidate['ref']} was downloaded but labels {metadata.get('labels', [])} did not match required labels {desired_labels}."
                 )
+                continue
+            readiness_issue = evaluate_image_dataset_readiness(
+                image_count=int(metadata.get("file_count") or 0),
+                label_count=int(metadata.get("label_count") or 0),
+                template_id=str(plan.get("templateId") or ""),
+            )
+            if readiness_issue:
+                remove_path_if_exists(str(target_dir))
+                if log_callback:
+                    log_callback(f"Rejected {candidate['ref']} because the dataset is not trainable here: {readiness_issue}")
+                attempts.append(f"{candidate['ref']}: {readiness_issue}")
                 continue
             selection = {
                 **candidate,
@@ -1167,14 +1299,20 @@ def select_kaggle_dataset_for_plan(plan: dict[str, Any]) -> dict[str, Any]:
                 "metadata": metadata,
                 "matchedLabels": matched_labels,
             }
+            if log_callback:
+                log_callback(f"Selected Kaggle dataset: {candidate['ref']}")
             return selection
         except HTTPException as exc:
             if target_dir is not None:
                 remove_path_if_exists(str(target_dir))
+            if log_callback:
+                log_callback(f"Kaggle candidate failed: {candidate['ref']} -> {exc.detail}")
             attempts.append(f"{candidate['ref']}: {exc.detail}")
         except Exception as exc:
             if target_dir is not None:
                 remove_path_if_exists(str(target_dir))
+            if log_callback:
+                log_callback(f"Kaggle candidate failed: {candidate['ref']} -> {exc}")
             attempts.append(f"{candidate['ref']}: {exc}")
 
     raise HTTPException(
@@ -1472,7 +1610,7 @@ def train_image_model(
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4 if use_pretrained_weights else 7e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=2)
     use_amp = device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if hasattr(torch, "amp") else torch.cuda.amp.GradScaler(enabled=use_amp)
 
     def run_eval(loader):
         model.eval()
@@ -1483,7 +1621,7 @@ def train_image_model(
             for images, labels in loader:
                 images = images.to(device, non_blocking=use_amp)
                 labels = labels.to(device, non_blocking=use_amp)
-                autocast_context = torch.cuda.amp.autocast() if use_amp else nullcontext()
+                autocast_context = torch.amp.autocast("cuda") if use_amp and hasattr(torch, "amp") else torch.cuda.amp.autocast() if use_amp else nullcontext()
                 with autocast_context:
                     logits = model(images)
                 probabilities = torch.softmax(logits, dim=1)
@@ -1493,21 +1631,27 @@ def train_image_model(
                 confidences.extend(probabilities.max(dim=1).values.cpu().tolist())
         return targets, predictions, confidences
 
-    progress_callback(15, "Building image tensors and data loaders")
-    progress_callback(18, f"Class balance in training split: {class_counts.tolist()}")
-    progress_callback(19, f"Loader config: batch_size={batch_size}, workers={num_workers}, amp={'enabled' if use_amp else 'disabled'}")
+    progress_callback(12, "Building image tensors and data loaders")
+    progress_callback(15, f"Class balance in training split: {class_counts.tolist()}")
+    progress_callback(18, f"Loader config: batch_size={batch_size}, workers={num_workers}, amp={'enabled' if use_amp else 'disabled'}")
     best_state_dict = copy.deepcopy(model.state_dict())
     best_val_accuracy = -1.0
     best_epoch = 0
+    last_batch_progress = -1
+    last_batch_log_time = 0.0
     for epoch in range(epochs):
         model.train()
         epoch_loss_total = 0.0
         epoch_items = 0
+        progress_callback(
+            20 + int((epoch / epochs) * 50),
+            f"Epoch {epoch + 1}/{epochs} started on {device_label}",
+        )
         for batch_index, (images, labels) in enumerate(train_loader):
             images = images.to(device, non_blocking=use_amp)
             labels = labels.to(device, non_blocking=use_amp)
             optimizer.zero_grad(set_to_none=True)
-            autocast_context = torch.cuda.amp.autocast() if use_amp else nullcontext()
+            autocast_context = torch.amp.autocast("cuda") if use_amp and hasattr(torch, "amp") else torch.cuda.amp.autocast() if use_amp else nullcontext()
             with autocast_context:
                 logits = model(images)
                 loss = criterion(logits, labels)
@@ -1516,8 +1660,18 @@ def train_image_model(
             scaler.update()
             epoch_loss_total += float(loss.item()) * len(labels)
             epoch_items += len(labels)
-            batch_progress = int(((epoch + (batch_index + 1) / max(1, len(train_loader))) / epochs) * 55)
-            progress_callback(20 + batch_progress, f"Epoch {epoch + 1}/{epochs} training on {device_label}")
+            batch_progress = 20 + int(((epoch + (batch_index + 1) / max(1, len(train_loader))) / epochs) * 50)
+            should_emit_batch_update = batch_progress > last_batch_progress and (
+                batch_progress - last_batch_progress >= 2 or time.time() - last_batch_log_time >= 1.5
+            )
+            if should_emit_batch_update:
+                percent_in_epoch = int(((batch_index + 1) / max(1, len(train_loader))) * 100)
+                progress_callback(
+                    batch_progress,
+                    f"Epoch {epoch + 1}/{epochs} training: {percent_in_epoch}% of epoch batches processed on {device_label}",
+                )
+                last_batch_progress = batch_progress
+                last_batch_log_time = time.time()
         val_true, val_pred, _ = run_eval(val_loader)
         val_accuracy = round(accuracy_score(val_true, val_pred) * 100, 2) if val_true else 0.0
         avg_loss = round(epoch_loss_total / max(epoch_items, 1), 4)
@@ -1526,14 +1680,19 @@ def train_image_model(
             best_val_accuracy = val_accuracy
             best_epoch = epoch + 1
             best_state_dict = copy.deepcopy(model.state_dict())
-        progress_callback(20 + int(((epoch + 1) / epochs) * 55), f"Epoch {epoch + 1}/{epochs} complete: loss={avg_loss}, val_accuracy={val_accuracy}%")
+        progress_callback(
+            20 + int(((epoch + 1) / epochs) * 50),
+            f"Epoch {epoch + 1}/{epochs} complete: loss={avg_loss}, val_accuracy={val_accuracy}%",
+        )
 
     model.load_state_dict(best_state_dict)
-    progress_callback(78, f"Restored best checkpoint from epoch {best_epoch} with val_accuracy={best_val_accuracy}%")
+    progress_callback(75, f"Restored best checkpoint from epoch {best_epoch} with val_accuracy={best_val_accuracy}%")
+    progress_callback(84, "Running final evaluation on the validation/test split")
     y_true, y_pred, confidences = run_eval(eval_loader)
     average = "binary" if len(class_names) == 2 else "weighted"
     precision = round(precision_score(y_true, y_pred, average=average, zero_division=0) * 100, 2)
     recall = round(recall_score(y_true, y_pred, average=average, zero_division=0) * 100, 2)
+    progress_callback(92, "Final metrics computed. Saving model artifact")
     return {
         "model_state_dict": model.state_dict(),
         "class_names": class_names,
@@ -1584,8 +1743,18 @@ def store_model_artifact(model_id: str, dataset_row: dict[str, Any], project_row
     training_epochs = int((model_row or {}).get("training_epochs") or 6)
     use_image_augmentation = bool((model_row or {}).get("use_image_augmentation"))
     if dataset_row.get("task_type") == "image-classification":
+        last_progress_write = -1
+        last_progress_write_at = 0.0
+
         def progress_callback(progress: int, message: str | None = None) -> None:
-            update_model_progress(model_id, min(progress, 95), "training")
+            nonlocal last_progress_write, last_progress_write_at
+            bounded_progress = min(progress, 95)
+            now_ts = time.time()
+            should_write_progress = bounded_progress >= 95 or bounded_progress - last_progress_write >= 2 or (now_ts - last_progress_write_at) >= 1.5
+            if should_write_progress:
+                update_model_progress(model_id, bounded_progress, "training")
+                last_progress_write = bounded_progress
+                last_progress_write_at = now_ts
             if message:
                 append_training_log(project_id, model_id, message)
 
@@ -1852,6 +2021,15 @@ def get_resource_usage():
     return get_system_resource_usage()
 
 
+@app.post("/api/system/storage/clear-cache")
+def clear_system_cache():
+    try:
+        return clear_cached_training_artifacts()
+    except Exception as exc:
+        logger.exception("Failed to clear cached training artifacts")
+        raise HTTPException(500, f"Could not clear cached models and datasets: {exc}") from exc
+
+
 @app.post("/api/system/llm/check")
 async def check_llm_connection(req: Request):
     body = await req.json()
@@ -1922,6 +2100,10 @@ async def build_project_from_prompt(payload: LlmProjectBuildRequest):
         raise HTTPException(400, "Describe the project you want to build in plain English")
 
     build_log: list[str] = [f"$ prompt: {prompt}"]
+
+    def append_build_log(message: str) -> None:
+        build_log.append(f"> {message}")
+
     fallback_plan = infer_project_plan_from_prompt(prompt)
     llm_plan: dict[str, Any] | None = None
     llm_warning: str | None = None
@@ -1930,43 +2112,47 @@ async def build_project_from_prompt(payload: LlmProjectBuildRequest):
         try:
             llm_plan = infer_project_plan_with_ollama(prompt, payload.provider, payload.baseUrl, payload.model)
             if llm_plan:
-                build_log.append(f"> planner: using Ollama model {payload.model or 'unknown'} to shape the project plan")
+                append_build_log(f"planner: using Ollama model {payload.model or 'unknown'} to shape the project plan")
         except Exception as exc:
             llm_warning = f"LLM planning fell back to heuristics: {exc}"
             build_log.append(f"! planner warning: {llm_warning}")
     else:
-        build_log.append("> planner: using fast heuristic template selection for a known project type")
+        append_build_log("planner: using fast heuristic template selection for a known project type")
 
     project_plan = normalize_project_plan(llm_plan, fallback_plan)
-    build_log.append(f"> template: {project_plan['templateId']}")
-    build_log.append(f"> search queries: {', '.join(project_plan['searchQueries'])}")
+    project_plan["preferSmallDataset"] = bool(payload.preferSmallDataset)
+    append_build_log(f"template: {project_plan['templateId']}")
+    append_build_log(f"search queries: {', '.join(project_plan['searchQueries'])}")
+    if payload.preferSmallDataset:
+        append_build_log("dataset size preference: small dataset mode enabled")
     if project_plan["taskType"] != "image-classification":
         raise HTTPException(400, "Auto build currently supports image-classification projects only.")
 
     ensure_database_ready()
     runtime_status = get_cuda_runtime_status()
     if runtime_status.get("cudaAvailable"):
-        build_log.append(f"> runtime: CUDA available on {runtime_status.get('gpuName') or 'GPU'}")
+        append_build_log(f"runtime: CUDA available on {runtime_status.get('gpuName') or 'GPU'}")
     else:
-        build_log.append("> runtime: CUDA not available, CPU fallback will be used unless GPU-required mode is enabled")
+        append_build_log("runtime: CUDA not available, CPU fallback will be used unless GPU-required mode is enabled")
     if payload.preferGpu and not runtime_status.get("cudaAvailable"):
         raise HTTPException(
             400,
             "GPU-required mode was requested, but CUDA is not available on this machine. Disable GPU-only mode or install a CUDA-ready PyTorch setup first.",
         )
 
-    dataset_selection = select_kaggle_dataset_for_plan(project_plan)
+    append_build_log("dataset search: starting Kaggle lookup")
+    dataset_selection = select_kaggle_dataset_for_plan(project_plan, log_callback=append_build_log)
     dataset_id = str(dataset_selection["datasetId"])
     dataset_metadata = dataset_selection["metadata"]
     dataset_name = dataset_selection.get("title") or dataset_selection["ref"].split("/")[-1]
-    build_log.append(f"> dataset: selected {dataset_selection['ref']}")
-    build_log.append(f"> labels: {', '.join(dataset_metadata.get('labels', []))}")
+    append_build_log(f"dataset: selected {dataset_selection['ref']}")
+    append_build_log(f"labels: {', '.join(dataset_metadata.get('labels', []))}")
     project_id = str(uuid.uuid4())
     model_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     requested_epochs = int(payload.trainingEpochs) if payload.trainingEpochs and int(payload.trainingEpochs) > 0 else None
     training_epochs, epoch_reason = estimate_training_epochs(prompt, dataset_metadata, requested_epochs)
-    build_log.append(f"> epochs: {training_epochs} ({epoch_reason})")
+    append_build_log(f"epochs: {training_epochs} ({epoch_reason})")
     conn: sqlite3.Connection | None = None
     project_row: dict[str, Any] | None = None
     dataset_row: dict[str, Any] | None = None
@@ -2044,8 +2230,8 @@ async def build_project_from_prompt(payload: LlmProjectBuildRequest):
         model_row = row_to_dict(conn.execute("SELECT * FROM ml_models WHERE id = ?", (model_id,)).fetchone())
         conn.commit()
         conn.close()
-        build_log.append(f"> project: created {project_plan['projectName']}")
-        build_log.append("> training: background training job started")
+        append_build_log(f"project: created {project_plan['projectName']}")
+        append_build_log("training: background training job started")
     except Exception as exc:
         try:
             if conn is not None:
@@ -2055,6 +2241,12 @@ async def build_project_from_prompt(payload: LlmProjectBuildRequest):
         safe_delete_project_resources(project_id)
         remove_path_if_exists(dataset_selection["localPath"])
         raise HTTPException(500, f"Could not create the auto-built project because the local database write failed: {exc}") from exc
+
+    for line in build_log[1:]:
+        if line.startswith("> "):
+            append_training_log(project_id, model_id, f"Auto build: {line[2:]}")
+        elif line.startswith("! "):
+            append_training_log(project_id, model_id, line)
 
     Thread(target=run_training_job, args=(model_id, project_id), daemon=True).start()
     message = (
@@ -2089,6 +2281,7 @@ async def build_project_from_prompt(payload: LlmProjectBuildRequest):
             "epochReason": epoch_reason,
             "usePretrainedWeights": bool(payload.usePretrainedWeights),
             "useImageAugmentation": bool(payload.useImageAugmentation),
+            "preferSmallDataset": bool(payload.preferSmallDataset),
         },
     }
 
@@ -2354,17 +2547,35 @@ def get_model(project_id: str):
 
 
 @app.get("/api/projects/{project_id}/training-logs")
-def get_training_logs(project_id: str):
+def get_training_logs(project_id: str, since: str | None = None, limit: int = 200):
+    safe_limit = max(1, min(limit, 500))
     conn = get_conn()
-    rows = conn.execute(
-        """
-        SELECT message, created_at
-        FROM training_logs
-        WHERE project_id = ?
-        ORDER BY created_at ASC
-        """,
-        (project_id,),
-    ).fetchall()
+    if since:
+        rows = conn.execute(
+            """
+            SELECT message, created_at
+            FROM training_logs
+            WHERE project_id = ? AND created_at > ?
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (project_id, since, safe_limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT message, created_at
+            FROM (
+                SELECT message, created_at
+                FROM training_logs
+                WHERE project_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            )
+            ORDER BY created_at ASC
+            """,
+            (project_id, safe_limit),
+        ).fetchall()
     conn.close()
     return [{"message": row["message"], "createdAt": row["created_at"]} for row in rows]
 
@@ -2373,7 +2584,11 @@ def get_training_logs(project_id: str):
 async def start_training(project_id: str, req: Request):
     project_exists(project_id)
     conn = get_conn()
-    dataset = conn.execute("SELECT id, task_type, label_count FROM datasets WHERE project_id = ? ORDER BY created_at DESC LIMIT 1", (project_id,)).fetchone()
+    project = conn.execute("SELECT template_id FROM projects WHERE id = ?", (project_id,)).fetchone()
+    dataset = conn.execute(
+        "SELECT id, task_type, label_count, file_count, metadata_json FROM datasets WHERE project_id = ? ORDER BY created_at DESC LIMIT 1",
+        (project_id,),
+    ).fetchone()
     if dataset is None:
         conn.close()
         raise HTTPException(400, "Upload a dataset before starting training")
@@ -2391,6 +2606,17 @@ async def start_training(project_id: str, req: Request):
     if dataset["task_type"] == "image-classification" and int(dataset["label_count"] or 0) < 2:
         conn.close()
         raise HTTPException(400, "Image training requires at least 2 classes/labels. Add another labeled image group before starting training.")
+    if dataset["task_type"] == "image-classification":
+        dataset_metadata = parse_json_dict(dataset["metadata_json"])
+        image_count = int(dataset_metadata.get("imageCount") or dataset["file_count"] or 0)
+        readiness_issue = evaluate_image_dataset_readiness(
+            image_count=image_count,
+            label_count=int(dataset["label_count"] or 0),
+            template_id=str(project["template_id"] if project and project["template_id"] is not None else ""),
+        )
+        if readiness_issue:
+            conn.close()
+            raise HTTPException(400, readiness_issue)
     if prefer_gpu and dataset["task_type"] != "image-classification":
         conn.close()
         raise HTTPException(400, "Always Use GPU is currently supported only for image-classification training.")
