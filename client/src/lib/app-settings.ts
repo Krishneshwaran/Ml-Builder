@@ -46,15 +46,19 @@ export const defaultSettings: AppSettings = {
   llmApiKey: "",
 };
 
+export function normalizeSettings(value: unknown): AppSettings {
+  const merged = { ...defaultSettings, ...(value && typeof value === "object" ? value : {}) };
+  if (merged.llmModel === "deepseek-r1:1.5b") {
+    merged.llmModel = defaultSettings.llmModel;
+  }
+  return merged;
+}
+
 export function loadSettings(): AppSettings {
   try {
     const saved = localStorage.getItem(SETTINGS_KEY);
     if (saved) {
-      const merged = { ...defaultSettings, ...JSON.parse(saved) };
-      if (merged.llmModel === "deepseek-r1:1.5b") {
-        merged.llmModel = defaultSettings.llmModel;
-      }
-      return merged;
+      return normalizeSettings(JSON.parse(saved));
     }
   } catch {}
   return defaultSettings;

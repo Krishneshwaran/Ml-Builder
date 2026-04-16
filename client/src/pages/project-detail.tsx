@@ -18,6 +18,13 @@ import { apiRequest, queryClient } from "@/lib/queryClient";
 import { loadSettings } from "@/lib/app-settings";
 import { systemTemplates, type Project, type Dataset, type MlModel, type Deployment, type PipelineStage } from "@shared/schema";
 
+type TrainingLogEntry = {
+  message: string;
+  createdAt: string;
+};
+
+const MAX_VISIBLE_TRAINING_LOGS = 300;
+
 export default function ProjectDetail() {
   const { id } = useParams<{ id: string }>();
   const [, setLocation] = useLocation();
@@ -27,6 +34,7 @@ export default function ProjectDetail() {
   const [deploymentType, setDeploymentType] = useState<"cloud-api" | "edge-device">("cloud-api");
   const [isTrainingBooting, setIsTrainingBooting] = useState(false);
   const [optimisticTrainingModel, setOptimisticTrainingModel] = useState<MlModel | null>(null);
+  const [trainingLogs, setTrainingLogs] = useState<TrainingLogEntry[]>([]);
 
   const {
     data: project,
@@ -51,11 +59,7 @@ export default function ProjectDetail() {
     refetchInterval: (query) => {
       const data = query.state.data as MlModel | undefined;
       if (data?.status === "training") {
-        return 1000;
-      }
-      // Continue polling for a bit after training completes to ensure UI updates
-      if (data?.status === "completed" && currentStep === 4) {
-        return 2000;
+        return 2500;
       }
       return false;
     },
@@ -67,10 +71,27 @@ export default function ProjectDetail() {
     enabled: !!id && hasProject,
   });
 
-  const { data: trainingLogs } = useQuery<Array<{ message: string; createdAt: string }>>({
-    queryKey: ["/api/projects", id, "training-logs"],
+  const { data: latestTrainingLogs } = useQuery<TrainingLogEntry[]>({
+    queryKey: ["/api/projects", id, "training-logs", "incremental"],
     enabled: !!id && hasProject && (model?.status === "training" || model?.status === "completed" || model?.status === "failed"),
-    refetchInterval: model?.status === "training" ? 1000 : false,
+    queryFn: async () => {
+      const params = new URLSearchParams({
+        limit: trainingLogs.length ? "200" : "120",
+      });
+      const lastSeenTimestamp = trainingLogs[trainingLogs.length - 1]?.createdAt;
+      if (lastSeenTimestamp) {
+        params.set("since", lastSeenTimestamp);
+      }
+      const response = await fetch(`/api/projects/${id}/training-logs?${params.toString()}`, {
+        credentials: "include",
+      });
+      if (!response.ok) {
+        const message = await response.text();
+        throw new Error(message || "Unable to load training logs");
+      }
+      return response.json();
+    },
+    refetchInterval: model?.status === "training" ? 2500 : false,
   });
 
   useEffect(() => {
@@ -91,6 +112,20 @@ export default function ProjectDetail() {
       setCurrentStep(project.currentStep);
     }
   }, [project]);
+
+  useEffect(() => {
+    setTrainingLogs([]);
+  }, [id]);
+
+  useEffect(() => {
+    if (!latestTrainingLogs?.length) return;
+    setTrainingLogs((current) => {
+      const seen = new Set(current.map((log) => `${log.createdAt}-${log.message}`));
+      const appended = latestTrainingLogs.filter((log) => !seen.has(`${log.createdAt}-${log.message}`));
+      if (!appended.length) return current;
+      return [...current, ...appended].slice(-MAX_VISIBLE_TRAINING_LOGS);
+    });
+  }, [latestTrainingLogs]);
 
   // Auto-advance to deployment step when training completes
   useEffect(() => {
@@ -416,7 +451,12 @@ export default function ProjectDetail() {
                     </div>
                   </CardContent>
                 </Card>
-                <LiveTrainingLogs progress={effectiveModel?.trainingProgress || (isTrainingBooting ? 5 : 0)} logs={trainingLogs} />
+                <LiveTrainingLogs
+                  progress={effectiveModel?.trainingProgress || (isTrainingBooting ? 5 : 0)}
+                  trainingEpochs={effectiveModel?.trainingEpochs}
+                  modelCreatedAt={effectiveModel?.createdAt}
+                  logs={trainingLogs}
+                />
               </>
             ) : effectiveModel?.status === "completed" ? (
               <>

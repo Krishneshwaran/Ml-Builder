@@ -76,6 +76,7 @@ type AutoBuildResponse = {
     epochReason?: string;
     usePretrainedWeights: boolean;
     useImageAugmentation: boolean;
+    preferSmallDataset?: boolean;
   } | null;
 };
 
@@ -99,6 +100,13 @@ type ResourceUsageResponse = {
     temperatureC?: number | null;
   }>;
 };
+
+type TrainingLogEntry = {
+  message: string;
+  createdAt: string;
+};
+
+const MAX_VISIBLE_TRAINING_LOGS = 300;
 
 function formatBytes(bytes?: number | null) {
   if (!bytes || bytes <= 0) return "Unknown size";
@@ -134,9 +142,11 @@ export default function LlmStudio() {
   );
   const [autoBuildRequireGpu, setAutoBuildRequireGpu] = useState(loadSettings().alwaysUseGpu);
   const [autoAssignEpochs, setAutoAssignEpochs] = useState(true);
+  const [preferSmallDataset, setPreferSmallDataset] = useState(false);
   const [isAutoBuilding, setIsAutoBuilding] = useState(false);
   const [autoBuildResult, setAutoBuildResult] = useState<AutoBuildResponse | null>(null);
   const [autoBuildConsoleLines, setAutoBuildConsoleLines] = useState<string[]>([]);
+  const [autoBuiltTrainingLogs, setAutoBuiltTrainingLogs] = useState<TrainingLogEntry[]>([]);
 
   const searchParams = new URLSearchParams(window.location.search);
   const attachedProjectId = searchParams.get("projectId") || "";
@@ -193,23 +203,40 @@ export default function LlmStudio() {
     enabled: !!autoBuiltProjectId,
     refetchInterval: (query) => {
       const data = query.state.data as MlModel | undefined;
-      return data?.status === "training" ? 1500 : false;
+      return data?.status === "training" ? 2500 : false;
     },
   });
 
-  const { data: autoBuiltTrainingLogs } = useQuery<Array<{ message: string; createdAt: string }>>({
-    queryKey: ["/api/projects", autoBuiltProjectId, "training-logs"],
+  const { data: latestAutoBuiltTrainingLogs } = useQuery<TrainingLogEntry[]>({
+    queryKey: ["/api/projects", autoBuiltProjectId, "training-logs", "incremental"],
     enabled:
       !!autoBuiltProjectId &&
       !!autoBuiltModel &&
       (autoBuiltModel.status === "training" || autoBuiltModel.status === "completed" || autoBuiltModel.status === "failed"),
-    refetchInterval: autoBuiltModel?.status === "training" ? 1500 : false,
+    queryFn: async () => {
+      const params = new URLSearchParams({
+        limit: autoBuiltTrainingLogs.length ? "200" : "120",
+      });
+      const lastSeenTimestamp = autoBuiltTrainingLogs[autoBuiltTrainingLogs.length - 1]?.createdAt;
+      if (lastSeenTimestamp) {
+        params.set("since", lastSeenTimestamp);
+      }
+      const response = await fetch(`/api/projects/${autoBuiltProjectId}/training-logs?${params.toString()}`, {
+        credentials: "include",
+      });
+      if (!response.ok) {
+        const message = await response.text();
+        throw new Error(message || "Unable to load training logs");
+      }
+      return response.json();
+    },
+    refetchInterval: autoBuiltModel?.status === "training" ? 2500 : false,
   });
 
   const { data: resourceUsage } = useQuery<ResourceUsageResponse>({
     queryKey: ["/api/system/resource-usage"],
     enabled: activeTab === "auto-build" && (!!autoBuiltProjectId || isAutoBuilding),
-    refetchInterval: autoBuiltModel?.status === "training" || isAutoBuilding ? 2000 : false,
+    refetchInterval: autoBuiltModel?.status === "training" || isAutoBuilding ? 5000 : false,
   });
 
   const selectedWorkflow =
@@ -220,6 +247,20 @@ export default function LlmStudio() {
       setSelectedWorkflowId(workflows[0].id);
     }
   }, [selectedWorkflowId, workflows]);
+
+  useEffect(() => {
+    setAutoBuiltTrainingLogs([]);
+  }, [autoBuiltProjectId]);
+
+  useEffect(() => {
+    if (!latestAutoBuiltTrainingLogs?.length) return;
+    setAutoBuiltTrainingLogs((current) => {
+      const seen = new Set(current.map((log) => `${log.createdAt}-${log.message}`));
+      const appended = latestAutoBuiltTrainingLogs.filter((log) => !seen.has(`${log.createdAt}-${log.message}`));
+      if (!appended.length) return current;
+      return [...current, ...appended].slice(-MAX_VISIBLE_TRAINING_LOGS);
+    });
+  }, [latestAutoBuiltTrainingLogs]);
 
   useEffect(() => {
     if (attachedProject) {
@@ -329,6 +370,7 @@ export default function LlmStudio() {
       `> model: ${settings.llmModel}`,
       `> gpu mode: ${autoBuildRequireGpu ? "required" : "auto-if-available"}`,
       `> epochs: ${autoAssignEpochs ? "auto-assign" : `${settings.imageTrainingEpochs} manual`}`,
+      `> dataset size: ${preferSmallDataset ? "prefer small dataset" : "any suitable size"}`,
       "> status: sending auto-build request...",
     ]);
     try {
@@ -342,6 +384,7 @@ export default function LlmStudio() {
         usePretrainedWeights: settings.usePretrainedWeights,
         trainingEpochs: autoAssignEpochs ? 0 : settings.imageTrainingEpochs,
         useImageAugmentation: settings.useImageAugmentation,
+        preferSmallDataset,
       });
       const result = (await response.json()) as AutoBuildResponse;
       setAutoBuildResult(result);
@@ -735,6 +778,7 @@ export default function LlmStudio() {
                       <Badge variant="secondary">{settings.usePretrainedWeights ? "Pretrained On" : "Pretrained Off"}</Badge>
                       <Badge variant="secondary">{settings.useImageAugmentation ? "Augmentation On" : "Augmentation Off"}</Badge>
                       <Badge variant="secondary">{autoAssignEpochs ? "Auto Epochs" : `${settings.imageTrainingEpochs} epochs`}</Badge>
+                      <Badge variant="secondary">{preferSmallDataset ? "Small Dataset" : "Any Dataset Size"}</Badge>
                     </div>
                     <div className="flex items-center justify-between gap-4 rounded-lg border bg-card px-4 py-3">
                       <div>
@@ -761,6 +805,23 @@ export default function LlmStudio() {
                         onCheckedChange={setAutoAssignEpochs}
                         data-testid="switch-llm-auto-build-epochs"
                       />
+                    </div>
+                    <div className="flex items-center justify-between gap-4 rounded-lg border bg-card px-4 py-3">
+                      <div>
+                        <p className="text-sm font-medium text-foreground">Prefer Small Dataset</p>
+                        <p className="text-xs text-muted-foreground">
+                          Choose smaller Kaggle datasets when possible so download and training finish faster.
+                        </p>
+                      </div>
+                      <Button
+                        type="button"
+                        variant={preferSmallDataset ? "default" : "outline"}
+                        size="sm"
+                        onClick={() => setPreferSmallDataset((current) => !current)}
+                        data-testid="button-llm-auto-build-small-dataset"
+                      >
+                        {preferSmallDataset ? "Small Dataset On" : "Use Small Dataset"}
+                      </Button>
                     </div>
                     <div className="rounded-lg border border-dashed p-4">
                       <p className="text-sm font-medium text-foreground mb-1">Internet dataset source</p>
@@ -1002,6 +1063,8 @@ export default function LlmStudio() {
               {!!autoBuiltProjectId && !!autoBuiltModel && (
                 <LiveTrainingLogs
                   progress={autoBuiltModel.trainingProgress ?? 0}
+                  trainingEpochs={autoBuiltModel.trainingEpochs}
+                  modelCreatedAt={autoBuiltModel.createdAt}
                   logs={autoBuiltTrainingLogs}
                 />
               )}
@@ -1102,6 +1165,9 @@ export default function LlmStudio() {
                           </Badge>
                           <Badge variant="secondary">
                             {`${autoBuildResult.trainingSettings?.trainingEpochs || settings.imageTrainingEpochs} epochs`}
+                          </Badge>
+                          <Badge variant="secondary">
+                            {autoBuildResult.trainingSettings?.preferSmallDataset ? "Small Dataset Preferred" : "Any Dataset Size"}
                           </Badge>
                         </div>
                         {autoBuildResult.trainingSettings?.epochReason && (

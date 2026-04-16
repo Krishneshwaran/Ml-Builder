@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState, type ChangeEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -10,12 +10,14 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest } from "@/lib/queryClient";
-import { SETTINGS_KEY, loadSettings, type AppSettings } from "@/lib/app-settings";
+import { SETTINGS_KEY, loadSettings, normalizeSettings, type AppSettings } from "@/lib/app-settings";
 
 export default function Settings() {
   const { toast } = useToast();
   const [settings, setSettings] = useState<AppSettings>(loadSettings);
   const [isTestingLlm, setIsTestingLlm] = useState(false);
+  const [isClearingCache, setIsClearingCache] = useState(false);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
   const [llmStatus, setLlmStatus] = useState<{
     reachable: boolean;
     modelAvailable: boolean;
@@ -43,6 +45,48 @@ export default function Settings() {
       title: "Settings saved",
       description: "Your preferences have been updated successfully.",
     });
+  };
+
+  const exportSettings = () => {
+    const payload = JSON.stringify(settings, null, 2);
+    const blob = new Blob([payload], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "automl-settings.json";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    toast({
+      title: "Settings exported",
+      description: "Your settings were downloaded as a JSON backup.",
+    });
+  };
+
+  const importSettings = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const nextSettings = normalizeSettings(parsed);
+      setSettings(nextSettings);
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(nextSettings));
+      toast({
+        title: "Settings imported",
+        description: "Your settings have been restored from the selected file.",
+      });
+    } catch (error) {
+      toast({
+        title: "Import failed",
+        description: error instanceof Error ? error.message : "The selected file is not valid settings JSON.",
+        variant: "destructive",
+      });
+    } finally {
+      event.target.value = "";
+    }
   };
 
   const applyInstalledModel = (modelName: string) => {
@@ -100,6 +144,26 @@ export default function Settings() {
     }
   };
 
+  const clearGeneratedCache = async () => {
+    setIsClearingCache(true);
+    try {
+      const response = await apiRequest("POST", "/api/system/storage/clear-cache");
+      const result = await response.json();
+      toast({
+        title: "Cache cleared",
+        description: result.message || "Generated models and dataset files were deleted.",
+      });
+    } catch (error) {
+      toast({
+        title: "Cache clear failed",
+        description: error instanceof Error ? error.message : "Could not clear cached models and datasets.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsClearingCache(false);
+    }
+  };
+
   return (
     <div className="p-6 max-w-3xl mx-auto space-y-6" data-testid="settings-page">
       <div>
@@ -108,6 +172,51 @@ export default function Settings() {
           Manage your account and platform preferences
         </p>
       </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Backup & Restore</CardTitle>
+          <CardDescription>Export your settings to a file or import them back later</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="rounded-lg border p-4 space-y-2">
+            <p className="font-medium text-foreground text-sm">Export current settings</p>
+            <p className="text-xs text-muted-foreground">
+              Download a JSON backup of your current configuration so you can restore it on this or another machine.
+            </p>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={exportSettings}
+              data-testid="button-export-settings"
+            >
+              Export Settings
+            </Button>
+          </div>
+          <div className="rounded-lg border p-4 space-y-2">
+            <p className="font-medium text-foreground text-sm">Import saved settings</p>
+            <p className="text-xs text-muted-foreground">
+              Restore a previously exported JSON file. Missing fields will fall back to the app defaults automatically.
+            </p>
+            <input
+              ref={importInputRef}
+              type="file"
+              accept="application/json,.json"
+              className="hidden"
+              onChange={importSettings}
+              data-testid="input-import-settings"
+            />
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => importInputRef.current?.click()}
+              data-testid="button-import-settings"
+            >
+              Import Settings
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>
@@ -466,6 +575,30 @@ export default function Settings() {
               data-testid="switch-notify-usage"
             />
           </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Storage Cleanup</CardTitle>
+          <CardDescription>Delete generated model and dataset cache files without touching your source code</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="rounded-lg border border-destructive/20 bg-destructive/5 p-4 space-y-2">
+            <p className="font-medium text-foreground text-sm">Clear cached models and datasets</p>
+            <p className="text-xs text-muted-foreground">
+              This removes generated training files from <code>backend/storage/models</code> and <code>backend/storage/datasets</code>, and clears related project records. It does not delete your app code.
+            </p>
+          </div>
+          <Button
+            type="button"
+            variant="destructive"
+            onClick={clearGeneratedCache}
+            disabled={isClearingCache}
+            data-testid="button-clear-generated-cache"
+          >
+            {isClearingCache ? "Clearing Cache..." : "Delete Models and Dataset Files"}
+          </Button>
         </CardContent>
       </Card>
 
